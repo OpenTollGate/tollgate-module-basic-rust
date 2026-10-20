@@ -112,7 +112,7 @@ fn rand_hex() -> String {
 /// amount of retrying makes concurrent mutation of one env var safe.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+pub fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     // A poisoned lock only means some other test panicked; the env var itself is still
     // usable, and failing here would replace one flake with another.
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -341,4 +341,10 @@ fn deserializes_upstream_detector_and_session_defaults() {
     let cfg: Config = serde_json::from_str(minimal).expect("minimal config should parse");
     let _: &UpstreamDetectorConfig = &cfg.upstream_detector;
     let _: &UpstreamWifiConfig = &cfg.upstream_wifi;
+}
+
+/// External test modules (e.g. identity::go_parity_tests) need the same
+/// env-serialisation guard; expose the static lock without moving it.
+pub fn env_lock_for_external() -> std::sync::MutexGuard<'static, ()> {
+    env_guard()
 }
