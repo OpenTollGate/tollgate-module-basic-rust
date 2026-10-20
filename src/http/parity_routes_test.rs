@@ -173,3 +173,82 @@ async fn all_five_parity_routes_are_registered() {
         );
     }
 }
+/// reveal-seed with a MNEMONIC derives the full identity via NIP-06, matching
+/// Go's DeriveFromMnemonic wire shape: mnemonic + privatekey + passwords echoed.
+/// (Loopback-only enforced earlier in this file; create_test_router mocks
+/// 192.168.1.50, so this drives the loopback path via create_test_router_at.)
+#[tokio::test]
+async fn reveal_seed_with_mnemonic_derives_nip06_identity() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    let mn = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let resp = crate::http::create_test_router_at(
+        state(),
+        std::net::SocketAddr::from(([127, 0, 0, 1], 9999)),
+    )
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/identity/reveal-seed")
+            .body(Body::from(mn.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let st = resp.status();
+    let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&b).to_string();
+    assert_eq!(st, StatusCode::OK, "got {st} {body}");
+    // Go ground-truth vector (identity.DeriveFromMnemonic):
+    assert!(
+        body.contains("5f29af3b9676180290e77a4efad265c4c2ff28a5302461f73597fda26bb25731"),
+        "key: {body}"
+    );
+    assert!(
+        body.contains("npub1az708q3kd9zy6z6f44zav5ygvdwelkzspf6mtusttx47lft2z38sghk0w7"),
+        "npub: {body}"
+    );
+    assert!(
+        body.contains("budget-charge-prosper-cream-slide-almost"),
+        "root pw: {body}"
+    );
+    assert!(
+        body.contains("receive-input-mule-afford-arrow-cat"),
+        "wifi pw: {body}"
+    );
+    assert!(body.contains("abandon abandon"), "mnemonic echoed: {body}");
+}
+
+/// A garbage body (not mnemonic, not hex) is refused like Go: 400 invalid mnemonic.
+#[tokio::test]
+async fn reveal_seed_with_garbage_is_400_invalid_mnemonic() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    let resp = crate::http::create_test_router_at(
+        state(),
+        std::net::SocketAddr::from(([127, 0, 0, 1], 9999)),
+    )
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/identity/reveal-seed")
+            .body(Body::from("garbage garbage"))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let st = resp.status();
+    let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(
+        b.starts_with(b"invalid mnemonic"),
+        "got {}",
+        String::from_utf8_lossy(&b)
+    );
+}

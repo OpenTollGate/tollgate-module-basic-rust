@@ -64,20 +64,27 @@ pub async fn handle_identity_reveal_seed(
             "forbidden: loopback only".to_string(),
         );
     }
-    // NIP-06 mnemonic -> key is Go's DeriveFromMnemonic; the Rust module stores
-    // only the key, so the mnemonic->key step is NOT ported here (it requires
-    // BIP39+SLIP-0132 derivation). What this route does: validate the provided
-    // key material and return the derivable identity from it. A body that is a
-    // 64-hex key is accepted; a 12-word mnemonic is refused with a pointer,
-    // rather than silently deriving something different from Go.
-    let key = String::from_utf8_lossy(&body).trim().to_string();
-    let looks_hex = key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit());
-    if !looks_hex {
-        return (
-            StatusCode::BAD_REQUEST,
-            "this build accepts a 64-hex private key; mnemonic recovery is not ported".to_string(),
-        );
-    }
+    // Go parity: the body is a 12-word BIP39 mnemonic; the key derives via
+    // NIP-06 (BIP39 seed -> BIP32 m/44'/1237'/0'/0/0), bit-for-bit with Go's
+    // identity.DeriveFromMnemonic (see identity_derive's Go-vector test). A
+    // 64-hex private key is also accepted — Go's RevealSeed(hex) path.
+    let raw = String::from_utf8_lossy(&body).trim().to_string();
+    let key = match identity_derive::private_key_from_mnemonic(&raw) {
+        Ok(k) => k,
+        Err(_mn_err) => {
+            // not a valid mnemonic — fall back to the raw-hex form
+            let looks_hex = raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit());
+            if !looks_hex {
+                return (StatusCode::BAD_REQUEST, "invalid mnemonic".to_string());
+            }
+            raw.clone()
+        }
+    };
+    let mnemonic_json = if identity_derive::private_key_from_mnemonic(&raw).is_ok() {
+        json!(raw)
+    } else {
+        serde_json::Value::Null
+    };
     match identity_derive::derive(&key) {
         Ok(d) => {
             let macs: serde_json::Map<String, serde_json::Value> =
@@ -86,6 +93,8 @@ pub async fn handle_identity_reveal_seed(
                 StatusCode::OK,
                 json!({
                     "npub": d.npub, "ipv4": d.ipv4, "macs": macs,
+                    "mnemonic": mnemonic_json,
+                    "privatekey": key,
                     "root_password": identity_derive::derive_root_password(&key),
                     "wifi_password": identity_derive::derive_wifi_password(&key, "private"),
                 })
