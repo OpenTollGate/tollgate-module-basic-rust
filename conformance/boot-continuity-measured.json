@@ -1,0 +1,41 @@
+{
+  "title": "ADR-0006 \u00a75 boot continuity \u2014 MEASURED on hardware",
+  "measured_at": "2026-10-20T07:29:33Z",
+  "device": "tollgate-A04E (GL-MT6000, OpenWrt 24.10.2, nodogsplash 5.0.2)",
+  "binary_sha256": "f61ea8101d6ebdfbd078ed7f209ac54e5da20ba6a232c9a57048f04f748fa5df",
+  "git_main": "83f73b4 (PRs #47 #48 #49)",
+  "procedure": [
+    "purchase amount=2 sats -> ISSUED, allotment 2000, session_active true",
+    "SIGKILL the module (kill -9; no shutdown hooks, no graceful drain)",
+    "restart the same binary against the same TOLLGATE_STATE_DB",
+    "observe WITHOUT any client action"
+  ],
+  "observed": [
+    {
+      "where": "module log",
+      "value": "restored gate for valid session at boot mac=50:76:af:2f:33:ed"
+    },
+    {
+      "where": "module log",
+      "value": "boot continuity: gates re-opened count=1"
+    },
+    {
+      "where": "ndsctl",
+      "value": "state: Authenticated (restored by the MODULE, client did nothing)"
+    },
+    {
+      "where": "GET /balance",
+      "value": "session_active: true, allotment 2000, remaining 1994, usage 6 (live)"
+    },
+    {
+      "where": "GET /usage",
+      "value": "8/2000 (live counter continuing)"
+    }
+  ],
+  "verdict": "PASS \u2014 the paid session, its allotment, live usage, and the gate all survive a hard kill and restart",
+  "notes": [
+    "This was the last UNVERIFIED item of ADR-0006. All \u00a71-\u00a75 decisions are now implemented AND measured.",
+    "The deauth-then-auth ordering in #47 worked as designed: the boot restore ran cleanly with no stale nds state.",
+    "Sessions that expired/exhausted while down are closed at open() and deliberately NOT re-authed (measured in PR #49's sweep test)."
+  ]
+}

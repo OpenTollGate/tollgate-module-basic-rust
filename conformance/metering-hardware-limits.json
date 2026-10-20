@@ -1,0 +1,42 @@
+{
+  "subject": "metering round trip on A04E",
+  "measured_at": "2026-10-19T14:30Z",
+  "device": "tollgate-A04E (GL-MT6000, OpenWrt 24.10.2)",
+  "nodogsplash": "5.0.2, managed interface br-lan",
+  "verdict": "UNVERIFIED \u2014 not measurable from the available vantage, and not measurable at all on this box as configured",
+  "findings": [
+    {
+      "fact": "ndsctl clients -> 0",
+      "meaning": "nodogsplash tracks no clients, so there is nothing to meter"
+    },
+    {
+      "fact": "ndsctl json 50:76:af:2f:33:ed -> {}",
+      "meaning": "the managed interface has never seen this MAC"
+    },
+    {
+      "fact": "host IS a br-lan client: lease 50:76:af:2f:33:ed = 192.168.1.159",
+      "meaning": "it is associated, but its INTERNET traffic does not traverse br-lan"
+    },
+    {
+      "fact": "ip route get 1.1.1.1 -> dev enx00e04c36043e via 192.168.2.1",
+      "meaning": "egress bypasses A04E entirely (wired default route wins on metric), so no bytes are attributable to the managed interface"
+    },
+    {
+      "fact": "ndsctl auth aa:bb:cc:dd:ee:77 -> 'Failed to authenticate client'",
+      "meaning": "even a synthetic MAC cannot be registered, so the diagnostic cannot be forced either"
+    }
+  ],
+  "what_is_proven": [
+    "ndsctl has NO `state` command (the old code called it) \u2014 measured, and fixed in PR #40",
+    "the `json` shape is {\"clients\":{\"<mac>\":{\"downloaded\":N,\"uploaded\":M}}} \u2014 parser written to it and unit-tested",
+    "`{}` from ndsctl is absence, now an Err rather than a silent (0,0) \u2014 unit-tested"
+  ],
+  "what_is_not_proven": [
+    "that poll_usage returns a NON-ZERO reading for a client that really transferred bytes",
+    "that /usage therefore reflects reality end to end"
+  ],
+  "how_to_close_it": [
+    "put a client on br-lan (WiFi guest SSID) and route its DEFAULT through the gateway, then transfer traffic and read ndsctl json <mac>",
+    "or run the same measurement on a box whose gate is actually carrying client traffic"
+  ]
+}

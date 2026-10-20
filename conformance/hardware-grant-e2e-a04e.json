@@ -1,0 +1,74 @@
+{
+  "measured_on": "tollgate-A04E (GL-MT6000, OpenWrt 24.10.2, aarch64_cortex-a53)",
+  "measured_at": "2026-10-19T14:12Z",
+  "binary_sha256": "3b402cdf8dba10a18bbd0de3aa7868089cec933ad4008a01dac23e424ade1f0d",
+  "git_main": "f7c7e15",
+  "mint": "http://192.168.2.13:3338 (cdk-mintd 0.18.1, fakewallet, lab-only)",
+  "client": "50:76:af:2f:33:ed at 192.168.1.159, resolved from /tmp/dhcp.leases",
+  "steps": [
+    {
+      "step": "pre-purchase /balance",
+      "observed": {
+        "status": 1,
+        "session_active": true,
+        "allotment": 4000,
+        "remaining": 4000,
+        "usage": 0,
+        "metric": "bytes",
+        "mac": "50:76:af:2f:33:ed"
+      },
+      "note": "session left from the previous run; proves /balance can now SEE a live session (it always answered session_active:false before PR #39)"
+    },
+    {
+      "step": "POST /ln-invoice amount=4",
+      "observed": {
+        "status": 1,
+        "state": "UNPAID",
+        "quote": "01a15481-5a14-7763-aa67-bdb15ed585d4"
+      }
+    },
+    {
+      "step": "GET /ln-invoice?quote=...",
+      "observed": {
+        "status": 1,
+        "state": "ISSUED",
+        "access_granted": true,
+        "allotment": 4000,
+        "metric": "bytes"
+      },
+      "note": "grant works end to end; before #38 this was 503 'device could not be identified'"
+    },
+    {
+      "step": "post-grant /balance",
+      "observed": {
+        "status": 1,
+        "session_active": true,
+        "allotment": 8000,
+        "remaining": 8000,
+        "usage": 0,
+        "metric": "bytes"
+      },
+      "note": "ADDITIVE top-up: 4000 -> 8000. Before #39 a second grant REPLACED the session and reset usage to 0"
+    },
+    {
+      "step": "GET /usage",
+      "observed": "0/8000"
+    },
+    {
+      "step": "GET /whoami",
+      "observed": "mac=50:76:af:2f:33:ed"
+    }
+  ],
+  "verdicts": {
+    "grant_end_to_end": "PASS (measured)",
+    "balance_sees_live_session": "PASS (measured)",
+    "second_grant_is_additive": "PASS (measured)",
+    "usage_preserved_across_topup": "PASS (0 before and after; no bytes transferred in this run so this is NOT a strong test of preservation)",
+    "corpus_conformance": "NOT MEASURED against this device"
+  },
+  "limits": [
+    "usage preservation is asserted by unit test + mutation, NOT by this run: no traffic was pushed, so usage was 0 -> 0 and would look identical if it had been reset",
+    "/balance active-session shape was previously unit-tested only; this run measures it on hardware for the first time",
+    "the corpus runner was NOT run against this device (that needs a mint issuing the corpus twins)"
+  ]
+}

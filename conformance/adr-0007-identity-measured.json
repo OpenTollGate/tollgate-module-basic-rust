@@ -1,0 +1,39 @@
+{
+  "title": "ADR-0007 identity forgery \u2014 MEASURED BLOCKED on hardware",
+  "measured_at": "2026-10-20T10:52:00Z",
+  "device": "tollgate-A04E (GL-MT6000, OpenWrt 24.10.2, nodogsplash 5.0.2)",
+  "binary_sha256": "36b105c8e3dfa663 (aarch64 musl static, built from main 4800615)",
+  "git_main": "4800615 (PRs #54 \u00a71/#3a, #56 \u00a72)",
+  "client": "50:76:af:2f:33:ed @ 192.168.1.159 (wlp59s0, br-lan)",
+  "attack": "X-Forwarded-For written by the caller \u2014 the pre-#54 identity source",
+  "results": [
+    {
+      "case": "honest client",
+      "whoami body": "mac=50:76:af:2f:33:ed",
+      "x-tollgate-client-mac": "50:76:af:2f:33:ed",
+      "x-tollgate-mac-claim-ignored": null
+    },
+    {
+      "case": "forged XFF 10.9.9.9",
+      "whoami body": "mac=50:76:af:2f:33:ed",
+      "x-tollgate-client-mac": "50:76:af:2f:33:ed",
+      "x-tollgate-mac-claim-ignored": "10.9.9.9",
+      "note": "identity unchanged; claim named by value"
+    },
+    {
+      "case": "forged XFF 192.168.1.1 (the gateway) on /balance",
+      "x-tollgate-client-mac": "50:76:af:2f:33:ed",
+      "x-tollgate-mac-claim-ignored": "192.168.1.1",
+      "note": "still answered for the real client's own paid session"
+    },
+    {
+      "case": "forged XFF 192.168.1.77 on /usage with a LIVE PAID SESSION",
+      "usage": "3/1000",
+      "x-tollgate-client-mac": "50:76:af:2f:33:ed",
+      "x-tollgate-mac-claim-ignored": "192.168.1.77",
+      "note": "the grader test: the forgery did NOT reach another session"
+    }
+  ],
+  "verdict": "PASS \u2014 a caller-written header no longer decides identity; the claim is reported by value",
+  "note_on_header_case": "HTTP header names are case-insensitive; the deployed response carries them lowercased (x-tollgate-client-mac). An initial probe looked them up in the exact case and wrongly concluded they were missing \u2014 recorded because it is exactly the kind of false negative that would have hidden a working fix."
+}
