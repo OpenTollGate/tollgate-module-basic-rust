@@ -1,7 +1,7 @@
 {
   "consumer": "tollgate-module-basic-rust",
   "corpus_version": "v1",
-  "measured_at": "2026-10-18T18:12:05Z",
+  "measured_at": "2026-10-20T15:34:31Z",
   "mint": "http://127.0.0.1:3338",
   "cdk_cli": "cdk-cli 0.18.1",
   "summary": {
@@ -16,14 +16,14 @@
       "fixture": "v4_v2_kg181",
       "verdict": "UNVERIFIED",
       "expected": "decoded-v4",
-      "note": "inconclusive: {\"content\":\"payment rejected: wallet receive failed: CDK error: Token Already Spent\",\"created_at\":1792347112,\"id\":\"c7449"
+      "note": "inconclusive: {\"content\":\"payment rejected: wallet receive failed: CDK error: Token Already Spent\",\"created_at\":1792510459,\"id\":\"f334d"
     },
     {
       "stage": "decode",
       "fixture": "v3_v2_kg181",
       "verdict": "UNVERIFIED",
       "expected": "decoded-v3",
-      "note": "inconclusive: {\"content\":\"payment rejected: wallet receive failed: CDK error: Token Already Spent\",\"created_at\":1792347112,\"id\":\"c7449"
+      "note": "inconclusive: {\"content\":\"payment rejected: wallet receive failed: CDK error: Token Already Spent\",\"created_at\":1792510459,\"id\":\"f334d"
     },
     {
       "stage": "decode",
@@ -200,5 +200,7 @@
       "expected": "-1/-1 or used/total",
       "note": "HTTP 200 -1/-1"
     }
-  ]
+  ],
+  "note": "Re-measured AFTER ADR-0007 \u00a71 (identity = TCP peer). Verdicts unchanged: the runner's X-Forwarded-For probes are now correctly IGNORED by the module, and the HTTP-02/03 shape assertions are identity-independent, so PASS/FAIL/UNVERIFIED is identical to the pre-\u00a71 set. The ADR-0007 follow-up concern ('runner identity semantics need a re-run') is closed by this file.",
+  "binary_built_from": "d133dad (upstream main, post-import)"
 }
