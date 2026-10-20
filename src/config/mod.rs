@@ -11,7 +11,7 @@ pub mod schema;
 pub use schema::{Config, IdentitiesConfig, InstallConfig};
 
 #[cfg(test)]
-mod tests;
+pub mod tests;
 
 use std::path::PathBuf;
 

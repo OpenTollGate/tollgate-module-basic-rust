@@ -112,13 +112,15 @@ async fn rebind_without_a_ticket_is_400() {
     assert!(body.contains("invalid-request"), "got {body}");
 }
 
-/// /session/rebind with a garbage ticket: the failure is CLASSIFIED, matching
-/// Go's error vocabulary, so a portal can tell "restart invalidated" from "typo".
+/// /session/rebind with a garbage ticket: Go parity — ALL ticket failures collapse
+/// into one 403 "ticket-invalid" (all four mean the same thing to a client: this
+/// ticket cannot be used, request another). Measured on Go hardware before porting.
 #[tokio::test]
-async fn rebind_with_a_garbage_ticket_is_classified() {
+async fn rebind_with_a_garbage_ticket_is_go_wire() {
     let (st, body) = with_lease(|| post("/session/rebind", r#"{"ticket":"garbage"}"#)).await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "got {st} {body}");
-    assert!(body.contains("ticket-malformed"), "got {body}");
+    assert_eq!(st, StatusCode::FORBIDDEN, "got {st} {body}");
+    assert!(body.contains("ticket-invalid"), "got {body}");
+    assert!(body.contains("request a new one"), "got {body}");
 }
 
 /// GET /identity returns the derived identity for the module's key — the SAME

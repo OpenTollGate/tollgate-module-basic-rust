@@ -19,11 +19,11 @@ impl MerchantIdentity {
         let identities = crate::config::load_identities();
 
         if let Ok(Some(config)) = identities {
-            if let Some(owned) = config
-                .owned_identities
-                .iter()
-                .find(|o| o.name == "merchant")
-            {
+            // Go parity: owned_identities[0] IS the merchant key, regardless of
+            // its name field. Requiring name=="merchant" made a nameless file
+            // silently fork identity (Rust generated a new key and overwrote the
+            // file while Go kept reading [0]) — measured on hardware, fixed here.
+            if let Some(owned) = config.owned_identities.first() {
                 let secret_key = SecretKey::from_str(&owned.privatekey)
                     .map_err(|e| format!("invalid merchant private key: {e}"))?;
                 return Ok(MerchantIdentity {
@@ -82,3 +82,39 @@ impl MerchantIdentity {
 
 // Re-export SecretKey for convenience
 use std::str::FromStr;
+#[cfg(test)]
+mod go_parity_tests {
+    use super::*;
+
+    /// Regression (measured on hardware): a nameless identities.json must still
+    /// load owned_identities[0] as the merchant key — Go's semantics. Requiring
+    /// name=="merchant" silently forked identity between the two modules (Rust
+    /// regenerated and OVERWROTE the file while Go kept reading [0]).
+    #[test]
+    fn nameless_owned_identities_loads_first_entry() {
+        let dir = std::env::temp_dir().join(format!("tg-idn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _g = crate::config::tests::env_lock_for_external();
+        std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
+        // nameless entry with a FIXED key
+        std::fs::write(
+            dir.join("identities.json"),
+            r#"{"owned_identities":[{"privatekey":"d1a1ff3ac0ffee00000000000000000000000000000000000000000000000000"}]}"#,
+        )
+        .unwrap();
+        let id = MerchantIdentity::load_or_generate().expect("loads");
+        let key = id.secret_key.display_secret().to_string();
+        assert_eq!(
+            key,
+            "d1a1ff3ac0ffee00000000000000000000000000000000000000000000000000"
+        );
+        // and the file was NOT overwritten
+        let raw = std::fs::read_to_string(dir.join("identities.json")).unwrap();
+        assert!(
+            raw.contains("d1a1ff3ac0ffee"),
+            "file must not be rewritten on load"
+        );
+        std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

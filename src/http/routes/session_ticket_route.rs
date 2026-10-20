@@ -152,18 +152,14 @@ pub async fn handle_session_rebind(
     let verified = match t.verify(&req.ticket, now()) {
         Ok(v) => v,
         Err(e) => {
-            // Distinct codes per failure, like Go's error vocabulary: a portal
-            // resume flow must distinguish "restart invalidated" from "typo".
-            let (code, http) = match e {
-                TicketError::Malformed => ("ticket-malformed", StatusCode::BAD_REQUEST),
-                TicketError::Signature => ("ticket-invalid-restart", StatusCode::UNAUTHORIZED),
-                TicketError::Expired => ("ticket-expired", StatusCode::UNAUTHORIZED),
-                TicketError::Unknown => ("ticket-unknown", StatusCode::NOT_FOUND),
-                _ => ("ticket-error", StatusCode::INTERNAL_SERVER_ERROR),
-            };
+            // Go parity: all four ticket failures (malformed, signature — which is
+            // where a restart lands, unknown, expired) collapse into ONE code. All
+            // four mean the same thing to a client: this ticket cannot be used, ask
+            // for another one. Go's measured wire: 403 "ticket-invalid".
+            let _ = e;
             return json_resp(
-                http,
-                json!({"status": 0, "code": code, "error": format!("{e:?}")}),
+                StatusCode::FORBIDDEN,
+                json!({"status": 0, "code": "ticket-invalid", "error": "this session ticket is not valid; request a new one"}),
                 extra,
             );
         }
@@ -172,11 +168,12 @@ pub async fn handle_session_rebind(
     let prev_mac = match t.attachment_mac(&verified.handle) {
         Some(m) => m,
         None => {
+            // Go folds ErrTicketUnknown into the same 403 ticket-invalid.
             return json_resp(
-                StatusCode::NOT_FOUND,
-                json!({"status": 0, "code": "ticket-unknown", "error": "ticket unknown to this process"}),
+                StatusCode::FORBIDDEN,
+                json!({"status": 0, "code": "ticket-invalid", "error": "this session ticket is not valid; request a new one"}),
                 extra,
-            )
+            );
         }
     };
 
@@ -194,20 +191,27 @@ pub async fn handle_session_rebind(
     match t.rebind(&verified.handle, &new_mac, prev_authenticated, now()) {
         Ok(()) => {
             // Move the SESSION RECORD's key so usage/balance/gate follow the client.
-            let moved = {
+            let (moved, usage) = {
                 let mut sessions = state.sessions.lock().await;
-                sessions.move_session(&prev_mac, &new_mac).await
+                let m = sessions.move_session(&prev_mac, &new_mac).await;
+                // Go's success shape: {status, mac, usage:"used/total"} — the
+                // customer's meter follows the rebind and comes back on the wire.
+                let usage = sessions
+                    .get_session(&new_mac)
+                    .map(|s| format!("{}/{}", s.used, s.allotment))
+                    .unwrap_or_default();
+                (m, usage)
             };
             let _ = moved; // move failure is logged inside; ticket moved regardless
             json_resp(
                 StatusCode::OK,
-                json!({"status": 1, "code": "rebound", "mac": new_mac}),
+                json!({"status": 1, "mac": new_mac, "usage": usage}),
                 extra,
             )
         }
         Err(TicketError::AttachmentActive) => json_resp(
             StatusCode::CONFLICT,
-            json!({"status": 0, "code": "previous-attachment-active", "error": "the previous attachment is still authenticated"}),
+            json!({"status": 0, "code": "attachment-active", "error": "this session is still in use at its previous address; reconnect and try again once that device has left the network"}),
             extra,
         ),
         Err(e) => json_resp(

@@ -437,6 +437,10 @@ pub struct IdentitiesConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OwnedIdentity {
+    /// Optional in the Go model: identities.json entries may carry no name, and
+    /// owned_identities[0] is the merchant key regardless (hardware-measured
+    /// divergence — a nameless file must not fail the whole parse).
+    #[serde(default)]
     pub name: String,
     #[serde(rename = "privatekey")]
     pub privatekey: String,
