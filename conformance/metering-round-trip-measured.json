@@ -1,0 +1,56 @@
+{
+  "title": "END-TO-END METERING ROUND TRIP \u2014 MEASURED",
+  "measured_at": "2026-10-19T15:30Z",
+  "device": "tollgate-A04E (GL-MT6000, OpenWrt 24.10.2, nodogsplash 5.0.2, managed br-lan)",
+  "binary_sha256": "ff7fcfd8f6d765979b79ade3edca4cac85b17dc9e1e40b9aeab47fc613bb8d2d",
+  "git_main": "54719b7 (PR #43, gate opener)",
+  "client": "50:76:af:2f:33:ed @ 192.168.1.159 (wlp59s0, br-lan lease)",
+  "vantage_fix": "host route '1.1.1.1 via 192.168.1.1 dev wlp59s0' pushed test traffic through the gateway",
+  "chain": [
+    {
+      "step": "portal registration",
+      "observed": "curl http://192.168.1.1:2050/ -> 200; ndsctl began tracking the MAC"
+    },
+    {
+      "step": "purchase",
+      "observed": "POST /ln-invoice amount=4 -> status:1 state:UNPAID quote=01a154fe-..."
+    },
+    {
+      "step": "grant + gate",
+      "observed": "GET /ln-invoice?quote=... -> state:ISSUED access_granted:true allotment:4000"
+    },
+    {
+      "step": "gate verification",
+      "observed": "ndsctl json -> state:Authenticated (the module itself ran ndsctl auth)"
+    },
+    {
+      "step": "real traffic",
+      "observed": "curl --interface wlp59s0 http://1.1.1.1/ (routed via 192.168.1.1) -> 301, 167B x2 + HTTPS"
+    },
+    {
+      "step": "bytes counted",
+      "observed": "ndsctl json -> downloaded:6 uploaded:2 (then more as traffic continued)"
+    },
+    {
+      "step": "module reads live usage",
+      "observed": "GET /usage -> 14/4000 (live ndsctl poll, not the stored counter)"
+    },
+    {
+      "step": "session visible",
+      "observed": "GET /balance -> session_active:true usage:0 allotment:4000 remaining:4000 (stored counter; live usage visible via /usage)"
+    }
+  ],
+  "verdicts": {
+    "purchase_to_gate": "PASS (measured)",
+    "gate_opens_on_grant": "PASS (measured: state Preauthenticated->Authenticated by the module)",
+    "bytes_counted_by_nodogsplash": "PASS (measured: 0 -> 6/2 -> 14+)",
+    "module_reads_live_usage": "PASS (measured: /usage 14/4000)",
+    "metering_round_trip": "PASS \u2014 previously UNVERIFIED across PRs #40/#41/#42/#43"
+  },
+  "notes": [
+    "This closes the last UNVERIFIED hardware item from PR #43.",
+    "The earlier 'not measurable from this vantage' finding (PR #41) was correct for the time: egress had to be forced through br-lan with an explicit host route before nodogsplash could count anything.",
+    "/balance usage:0 vs /usage 14: /balance reports the STORED session counter (flushed per ADR-0002 batching), /usage reports the LIVE ndsctl poll. Both are correct per their contracts; the divergence is documented, not a bug.",
+    "The evidence JSONs in PR #41 (metering-hardware-limits) described a vantage limitation that this run overcame via the explicit route. Kept for history."
+  ]
+}

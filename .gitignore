@@ -1,0 +1,17 @@
+/target
+*.db
+*.db-wal
+*.db-jal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Python bytecode (a .pyc was accidentally committed in #25; keep them out)
+__pycache__/
+*.py[cod]

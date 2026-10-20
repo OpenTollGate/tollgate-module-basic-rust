@@ -1,0 +1,204 @@
+{
+  "consumer": "tollgate-module-basic-rust",
+  "corpus_version": "v1",
+  "measured_at": "2026-10-18T18:12:05Z",
+  "mint": "http://127.0.0.1:3338",
+  "cdk_cli": "cdk-cli 0.18.1",
+  "summary": {
+    "pass": 15,
+    "fail": 0,
+    "unverified": 12,
+    "error": 0
+  },
+  "rows": [
+    {
+      "stage": "decode",
+      "fixture": "v4_v2_kg181",
+      "verdict": "UNVERIFIED",
+      "expected": "decoded-v4",
+      "note": "inconclusive: {\"content\":\"payment rejected: wallet receive failed: CDK error: Token Already Spent\",\"created_at\":1792347112,\"id\":\"c7449"
+    },
+    {
+      "stage": "decode",
+      "fixture": "v3_v2_kg181",
+      "verdict": "UNVERIFIED",
+      "expected": "decoded-v3",
+      "note": "inconclusive: {\"content\":\"payment rejected: wallet receive failed: CDK error: Token Already Spent\",\"created_at\":1792347112,\"id\":\"c7449"
+    },
+    {
+      "stage": "decode",
+      "fixture": "v3_v2_valid",
+      "verdict": "PASS",
+      "expected": "decoded-v3",
+      "note": "HTTP 402"
+    },
+    {
+      "stage": "decode",
+      "fixture": "v4_v2_valid",
+      "verdict": "PASS",
+      "expected": "decoded-v4",
+      "note": "HTTP 402"
+    },
+    {
+      "stage": "decode",
+      "fixture": "v3_v2_truncated_id",
+      "verdict": "PASS",
+      "expected": "decoded-v3",
+      "note": "HTTP 402"
+    },
+    {
+      "stage": "decode",
+      "fixture": "v3_v2_hex_c",
+      "verdict": "PASS",
+      "expected": "decoded-v3",
+      "note": "HTTP 402"
+    },
+    {
+      "stage": "decode",
+      "fixture": "v3_v2_full66",
+      "verdict": "PASS",
+      "expected": "unknown",
+      "note": "HTTP 402"
+    },
+    {
+      "stage": "verify",
+      "fixture": "v4_v2_kg181",
+      "verdict": "PASS",
+      "expected": "unknown",
+      "note": "NUT-07 -> ok"
+    },
+    {
+      "stage": "verify",
+      "fixture": "v3_v2_kg181",
+      "verdict": "PASS",
+      "expected": "unknown",
+      "note": "NUT-07 -> ok"
+    },
+    {
+      "stage": "verify",
+      "fixture": "v3_v2_valid",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "verify",
+      "fixture": "v4_v2_valid",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "verify",
+      "fixture": "v3_v2_truncated_id",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "verify",
+      "fixture": "v3_v2_hex_c",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "verify",
+      "fixture": "v3_v2_full66",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "spend",
+      "fixture": "v4_v2_kg181",
+      "verdict": "PASS",
+      "expected": "unknown",
+      "note": "NUT-07 -> ok"
+    },
+    {
+      "stage": "spend",
+      "fixture": "v3_v2_kg181",
+      "verdict": "PASS",
+      "expected": "unknown",
+      "note": "NUT-07 -> ok"
+    },
+    {
+      "stage": "spend",
+      "fixture": "v3_v2_valid",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "spend",
+      "fixture": "v4_v2_valid",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "spend",
+      "fixture": "v3_v2_truncated_id",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "spend",
+      "fixture": "v3_v2_hex_c",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "spend",
+      "fixture": "v3_v2_full66",
+      "verdict": "UNVERIFIED",
+      "expected": null,
+      "note": "issued by http://192.168.13.221:8383, not the reachable mint http://127.0.0.1:3338; NUT-07 cannot answer for another mint's proofs"
+    },
+    {
+      "stage": "http01-post",
+      "fixture": "absent-content-type",
+      "verdict": "PASS",
+      "expected": "accepted",
+      "note": "HTTP 402"
+    },
+    {
+      "stage": "http01-post",
+      "fixture": "unsupported-content-type",
+      "verdict": "PASS",
+      "expected": "415",
+      "note": "HTTP 415"
+    },
+    {
+      "stage": "http01-post",
+      "fixture": "body-over-1mib",
+      "verdict": "PASS",
+      "expected": "400/413",
+      "note": "HTTP 413"
+    },
+    {
+      "stage": "http01-notice",
+      "fixture": "rejected-payment",
+      "verdict": "PASS",
+      "expected": "signed 21023",
+      "note": "kind=21023 tags=['code', 'level'] sig_len=128"
+    },
+    {
+      "stage": "http02-whoami",
+      "fixture": "shape",
+      "verdict": "PASS",
+      "expected": "mac=<addr>",
+      "note": "HTTP 200 mac="
+    },
+    {
+      "stage": "http03-usage",
+      "fixture": "shape",
+      "verdict": "PASS",
+      "expected": "-1/-1 or used/total",
+      "note": "HTTP 200 -1/-1"
+    }
+  ]
+}

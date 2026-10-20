@@ -1,0 +1,99 @@
+name: Cross-compile + Package
+
+on:
+  push:
+    branches: [main, "phase-*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt check
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --verbose
+
+  cross-build:
+    name: cross ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            use-cross: false
+          - target: aarch64-unknown-linux-musl
+            use-cross: true
+          - target: armv7-unknown-linux-musleabihf
+            use-cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- x86_64: native musl-gcc (fast, no Docker needed) ---
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.use-cross == false
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (musl-gcc)
+        if: matrix.use-cross == false
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # --- ARM: use cross (Docker-based, proper musl cross-toolchains) ---
+      # ring (used by rustls) compiles pregenerated assembly that zig cc
+      # and naive GCC cross-compilers can't handle. cross uses Docker images
+      # with full musl cross-toolchains that work correctly.
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.use-cross == true
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross == true
+        run: cargo install cross
+
+      - name: Cross build (Docker)
+        if: matrix.use-cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Binary size
+        run: |
+          BIN=target/${{ matrix.target }}/release/tollgate-module-basic-rust
+          ls -lh "$BIN"
+          strip "$BIN" 2>/dev/null || true
+          ls -lh "$BIN"
+          echo "SIZE_BYTES=$(stat -c %s "$BIN")" >> $GITHUB_ENV
+
+      - name: Stage binary for packaging
+        run: |
+          mkdir -p openwrt
+          cp target/${{ matrix.target }}/release/tollgate-module-basic-rust \
+             openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tollgate-${{ matrix.target }}
+          path: openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+          if-no-files-found: error

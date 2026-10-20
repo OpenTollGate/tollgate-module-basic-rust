@@ -1,0 +1,69 @@
+[package]
+name = "tollgate-module-basic-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Rust clone of tollgate-module-basic-go — drop-in replacement using CDK instead of gonuts"
+license = "MIT"
+repository = "https://github.com/felixfelix-bot/tollgate-module-basic-rust"
+publish = false
+
+[lib]
+name = "tollgate_module_basic_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tollgate-module-basic-rust"
+path = "src/main.rs"
+
+[dependencies]
+# P1: durable sessions/quotes. Already in the lock via cdk-sqlite, so this
+# adds no new code to build — it only makes the existing crate addressable.
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time", "io-util", "fs", "process"] }
+axum = { version = "0.8", features = ["ws"] }
+
+# HTTP middleware (CORS, timeouts, tracing) — versions compatible with axum 0.8 / hyper 1.x
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
+http-body-util = "0.1"
+
+# Cashu Development Kit (wallet side — we are a wallet talking to mints)
+cdk = { version = "0.18", default-features = false, features = ["wallet"] }
+cdk-sqlite = "0.18"
+
+# Cashu protocol primitives (Token parsing, NUT types)
+cashu = "0.18"
+
+# Serde / JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client (rustls — no OpenSSL for musl compat)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Nostr identity signing (BIP-340 Schnorr)
+secp256k1 = { version = "0.29", features = ["rand", "global-context", "serde"] }
+rand = "0.8"
+
+# Hex / hashing for Nostr event IDs
+hex = "0.4"
+sha2 = "0.10"
+
+# Error derive macro
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+# Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
+panic = "abort"
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

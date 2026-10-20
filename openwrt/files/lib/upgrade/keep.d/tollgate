@@ -1,0 +1,7 @@
+# Files to preserve across sysupgrade. Each line is a path prefix
+# that the OpenWrt sysupgrade tool keeps intact.
+/etc/tollgate/config.json
+/etc/tollgate/identities.json
+/etc/tollgate/wallet_seed.bin
+/etc/tollgate/install.json
+/etc/tollgate/ecash/

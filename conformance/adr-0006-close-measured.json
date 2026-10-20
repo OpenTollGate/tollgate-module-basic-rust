@@ -1,0 +1,37 @@
+{
+  "title": "ADR-0006 close path \u2014 MEASURED end to end on hardware",
+  "measured_at": "2026-10-20T07:25:27Z",
+  "device": "tollgate-A04E (GL-MT6000, OpenWrt 24.10.2, nodogsplash 5.0.2, managed br-lan)",
+  "binary_sha256": "f61ea8101d6ebdfbd078ed7f209ac54e5da20ba6a232c9a57048f04f748fa5df",
+  "git_main": "241c2b2 (PR #48 idempotency; #47 sweep)",
+  "client": "50:76:af:2f:33:ed @ 192.168.1.159 (wlp59s0, forced-route vantage)",
+  "tests": [
+    {
+      "test": "GET idempotency (#48)",
+      "procedure": "poll the SAME settled quote 12 additional times",
+      "observed": "allotment [1000]*12 \u2014 IDENTICAL across every re-poll",
+      "prior": "1000 -> 12000 over 12 polls before the fix (measured 2026-10-19)",
+      "verdict": "PASS"
+    },
+    {
+      "test": "sweep close on exhaustion (#47)",
+      "procedure": "burn live bytes through br-lan until used >= allotment, wait <=30s",
+      "observed": "usage 1528/1000 -> t+30s: /usage -1/-1 (session revoked)",
+      "log_line": "gate closed for terminal session mac=50:76:af:2f:33:ed (07:25:27Z)",
+      "verdict": "PASS"
+    },
+    {
+      "test": "gate actually closed (the point of ADR-0006)",
+      "procedure": "attempt egress through the gateway after the sweep",
+      "observed": "HTTP 307 -> http://192.168.1.1:2050/splash.html?redir=... (captive portal redirect)",
+      "ndsctl_state": "Preauthenticated (was Authenticated before the sweep)",
+      "verdict": "PASS \u2014 the client is BLOCKED again, measured not asserted"
+    }
+  ],
+  "chain": "pay -> gate opens -> bytes counted -> allotment exhausted -> sweep deauths within 30s -> portal re-blocks the client",
+  "notes": [
+    "This closes the loop opened by #47: its first measurement was invalidated by the re-grant bug (#48), which is now fixed and itself measured.",
+    "The exhaustion test needed cache-busted pulls (1.1.1.1 serves tiny 301 bodies) \u2014 usage moved ~75 bytes per pull, so exhaustion took multiple bursts. Not a product issue.",
+    "Boot continuity (\u00a75) remains unit-tested only; not re-measured on hardware this run."
+  ]
+}

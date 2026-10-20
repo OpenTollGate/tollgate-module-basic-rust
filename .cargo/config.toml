@@ -1,0 +1,6 @@
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+
+# ARM musl targets: cross-compilation is handled by `cross` (Docker-based)
+# in CI. For local builds, install a musl cross-toolchain or use `cross`:
+#   cargo install cross && cross build --release --target aarch64-unknown-linux-musl
