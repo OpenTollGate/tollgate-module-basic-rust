@@ -199,6 +199,24 @@ impl SessionManager {
         &self.sessions
     }
 
+    /// Move a session record from one MAC to another (rebind): the paid
+    /// allotment, the usage counter and the expiry all follow the customer.
+    /// Persisted, so a restart does not split the session across two addresses.
+    pub async fn move_session(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let Some(s) = self.sessions.remove(from) else {
+            return Ok(()); // nothing to move; the ticket already moved
+        };
+        if let Some(st) = &self.store {
+            let _ = st.delete_session(from);
+            let _ = st.upsert_session(&s);
+        }
+        if let Some(p) = self.pending.remove(from) {
+            self.pending.insert(to.to_string(), p);
+        }
+        self.sessions.insert(to.to_string(), s);
+        Ok(())
+    }
+
     /// Look up a session by MAC address.
     pub fn get_session(&self, mac: &str) -> Option<&CustomerSession> {
         self.sessions.get(mac)

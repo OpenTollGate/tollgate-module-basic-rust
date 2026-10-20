@@ -65,6 +65,26 @@ pub fn create_router(state: AppState) -> Router {
             axum::routing::get(routes::balance::handle_balance),
         )
         .route(
+            "/identity",
+            axum::routing::get(routes::identity::handle_identity),
+        )
+        .route(
+            "/identity/reveal-seed",
+            axum::routing::post(routes::identity::handle_identity_reveal_seed),
+        )
+        .route(
+            "/session-state",
+            axum::routing::get(routes::session_state::handle_session_state),
+        )
+        .route(
+            "/session/ticket",
+            axum::routing::post(routes::session_ticket_route::handle_session_ticket),
+        )
+        .route(
+            "/session/rebind",
+            axum::routing::post(routes::session_ticket_route::handle_session_rebind),
+        )
+        .route(
             "/ln-invoice",
             axum::routing::post(routes::ln_invoice::handle_create_ln_invoice)
                 .get(routes::ln_invoice::handle_get_ln_invoice),
@@ -97,6 +117,9 @@ pub fn create_test_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod identity_test;
+
+#[cfg(test)]
+mod parity_routes_test;
 
 #[cfg(test)]
 mod wire_identity_test;
