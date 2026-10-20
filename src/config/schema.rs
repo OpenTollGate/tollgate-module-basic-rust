@@ -17,7 +17,10 @@ pub struct Config {
     pub accepted_mints: Vec<MintConfig>,
     #[serde(default)]
     pub profit_share: Vec<ProfitShareConfig>,
-    #[serde(default)]
+    /// Default 21 MiB (the price-table step). A bare `#[serde(default)]` here
+    /// deserialized partial configs to step_size=0, which silently rejected
+    /// EVERY payment with "does not cover one step" — measured on hardware.
+    #[serde(default = "default_step_size")]
     pub step_size: u64,
     #[serde(default)]
     pub margin: Option<f64>,
@@ -50,6 +53,10 @@ fn default_identity_from_socket() -> bool {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_step_size() -> u64 {
+    22_020_096 // 21 MiB
 }
 
 fn default_metric() -> String {
