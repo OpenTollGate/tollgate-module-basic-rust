@@ -348,3 +348,29 @@ fn deserializes_upstream_detector_and_session_defaults() {
 pub fn env_lock_for_external() -> std::sync::MutexGuard<'static, ()> {
     env_guard()
 }
+/// Hardware-measured hazard (PR #4 evidence): a partial config.json (only
+/// accepted_mints) deserialized step_size to 0, making EVERY payment fail with
+/// "does not cover one step" — silently. The default must be the price-table
+/// step (21 MiB), not the serde integer zero.
+#[test]
+fn partial_config_yields_default_step_size_not_zero() {
+    let _g = env_guard();
+    let dir = std::env::temp_dir().join(format!("tg-step-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"accepted_mints":[{"url":"http://m.example"}]}"#,
+    )
+    .unwrap();
+    let cfg = crate::config::load_config()
+        .expect("config loads")
+        .expect("present");
+    assert_eq!(
+        cfg.step_size, 22_020_096,
+        "partial config must default to 21 MiB steps, got {}",
+        cfg.step_size
+    );
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(&dir);
+}
