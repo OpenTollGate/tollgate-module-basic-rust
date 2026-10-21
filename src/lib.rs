@@ -9,5 +9,6 @@ pub mod metering;
 pub mod nostr_event;
 pub mod session;
 pub mod session_ticket;
+pub mod spilman;
 pub mod tracing_setup;
 pub mod wallet;

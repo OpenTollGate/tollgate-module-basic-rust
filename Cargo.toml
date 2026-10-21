@@ -66,6 +66,8 @@ sha2 = "0.10"
 
 # Error derive macro
 thiserror = "1"
+# Async trait methods for the PaymentRail seam (already in the lock via cdk-spilman).
+async-trait = "0.1"
 hmac = "0.12"
 base64 = "0.23.1"
 bech32 = "0.11"
