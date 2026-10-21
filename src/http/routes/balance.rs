@@ -85,8 +85,8 @@ pub async fn handle_balance(
             let sessions = state.sessions.lock().await;
             match sessions.get_session(m) {
                 Some(s) => {
-                    let used = s.used as u64;
-                    let allotment = s.allotment as u64;
+                    let used = s.used;
+                    let allotment = s.allotment;
                     ActiveSession {
                         status: 1,
                         session_active: true,

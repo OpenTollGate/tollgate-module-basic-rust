@@ -89,13 +89,16 @@ mod tests {
     use crate::config::schema::Config;
     use crate::http::AppState;
     use crate::session::SessionManager;
-    use axum::body::Body;
     use axum::extract::{ConnectInfo, State};
     use axum::http::{Request, StatusCode};
     use axum::response::IntoResponse;
     use std::sync::Arc;
-    use tower::ServiceExt;
 
+    // Pre-existing site (not introduced by the Spilman work): this helper builds a
+    // default config then overrides one field, which the lint prefers as struct-update
+    // syntax. Left as-is deliberately — it is a test fixture, and rewriting seven such
+    // fixtures across the route tests would be churn without a behavioural payoff.
+    #[allow(clippy::field_reassign_with_default)]
     fn state_with(sessions: SessionManager) -> AppState {
         let mut cfg = Config::default();
         cfg.metric = "bytes".to_string();
@@ -112,6 +115,7 @@ mod tests {
             quotes: Arc::new(std::sync::Mutex::new(
                 crate::http::routes::quote::MintQuoteRegistry::new(),
             )),
+            spilman: None,
         }
     }
 

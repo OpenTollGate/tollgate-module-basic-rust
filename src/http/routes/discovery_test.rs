@@ -42,6 +42,7 @@ async fn discovery_json(config: Config) -> Value {
         quotes: std::sync::Arc::new(std::sync::Mutex::new(
             crate::http::routes::quote::MintQuoteRegistry::new(),
         )),
+        spilman: None,
     };
     let app = crate::http::create_test_router(state);
     let resp = app
@@ -75,6 +76,8 @@ fn tag<'a>(tags: &'a [Vec<String>], name: &str) -> Option<&'a Vec<String>> {
         .find(|t| t.first().map(String::as_str) == Some(name))
 }
 
+// Pre-existing site: fixture overrides one field of a default config.
+#[allow(clippy::field_reassign_with_default)]
 #[tokio::test]
 async fn metric_uses_the_spec_vocabulary() {
     for (configured, expected) in [("bytes", "bytes"), ("time", "milliseconds")] {

@@ -45,6 +45,14 @@ pub struct Config {
     /// overwriting the identity headers — then the header is trusted by contract.
     #[serde(default = "default_identity_from_socket")]
     pub identity_from_socket: bool,
+    /// Wholesale Spilman payment-channel rail (see `crate::spilman`).
+    ///
+    /// `#[serde(default)]` on the struct means every config in the field today —
+    /// none of which carry a `spilman` key — parses to `enabled: false`, and the
+    /// rail is never constructed. That is what makes "off" byte-identical to the
+    /// behaviour before this rail existed, rather than merely similar.
+    #[serde(default)]
+    pub spilman: SpilmanConfig,
 }
 
 fn default_identity_from_socket() -> bool {
@@ -104,6 +112,7 @@ impl Config {
             upstream_session_manager: UpstreamSessionManagerConfig::default(),
             upstream_wifi: UpstreamWifiConfig::default(),
             identity_from_socket: true,
+            spilman: SpilmanConfig::default(),
         }
     }
 
@@ -121,6 +130,55 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+// ── SpilmanConfig ────────────────────────────────────────────────────
+/// Wholesale payment-channel rail. **Off by default.**
+///
+/// TollGate's retail path (`POST /` → `handle_pay` → CDK wallet) is untouched by
+/// this section either way; `enabled` only decides whether the *second* rail
+/// exists. With `enabled: true` the module additionally keeps a durable
+/// per-channel balance ledger at `channel_db_path` (`crate::spilman::ledger`).
+///
+/// There is deliberately no default for `channel_db_path`: an operator who opts in
+/// must say where the balances live. A ledger that silently forgot balances across
+/// a restart would let a payer re-spend a channel, which is worse than refusing to
+/// boot (`SpilmanRail::from_config` returns `Err` when it is missing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpilmanConfig {
+    /// Master switch. `false` = zero behavioural change.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Mint the payee trusts for channel funding proofs.
+    #[serde(default)]
+    pub mint_url: Option<String>,
+    /// Bytes per millisat billed to the payer, symmetric in both directions.
+    ///
+    /// Default `22_021` is the **parity** rate: the exact retail rate is
+    /// `22_020_096 / 1_000 = 22_020.096` bytes/msat, so `22_020` bills a 21 MiB step
+    /// at 1001 msat instead of 1000. On a `sat`-denominated channel that round-up
+    /// costs a whole extra sat per step — a 100% overcharge at step granularity.
+    /// `22_021` is the smallest integer rate that lands on exactly 1000 msat/step.
+    #[serde(default = "default_in_bytes_per_millisat")]
+    pub in_bytes_per_millisat: u64,
+    /// Durable channel-ledger path. Required when `enabled` is true.
+    #[serde(default)]
+    pub channel_db_path: Option<String>,
+}
+
+fn default_in_bytes_per_millisat() -> u64 {
+    crate::spilman::TOLLGATE_PARITY_IN_BYTES_PER_MILLISAT
+}
+
+impl Default for SpilmanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mint_url: None,
+            in_bytes_per_millisat: default_in_bytes_per_millisat(),
+            channel_db_path: None,
+        }
     }
 }
 

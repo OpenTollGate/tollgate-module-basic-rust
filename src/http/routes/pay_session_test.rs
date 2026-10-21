@@ -65,6 +65,7 @@ fn allotment_rejects_zero_price() {
 // The event itself
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::field_reassign_with_default)]
 fn build_session_event_for_test() -> Value {
     let mut cfg = Config::default();
     cfg.metric = "bytes".to_string();
@@ -136,6 +137,7 @@ fn session_event_carries_every_tip01_tag() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn session_event_emits_p_only_when_a_customer_pubkey_exists() {
     let mut cfg = Config::default();
     cfg.metric = "bytes".to_string();

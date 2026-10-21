@@ -37,6 +37,7 @@ fn state_with_session(mac: &str, allotment: u64) -> AppState {
         quotes: Arc::new(Mutex::new(
             crate::http::routes::quote::MintQuoteRegistry::new(),
         )),
+        spilman: None,
     }
 }
 

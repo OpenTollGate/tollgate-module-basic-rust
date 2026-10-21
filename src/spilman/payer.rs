@@ -300,6 +300,11 @@ mod tests {
     }
 
     #[test]
+    // `DEFAULT_CHANNEL_LIFETIME_SECS` is a const, so this assertion is a compile-time
+    // pin on the constant's value rather than a runtime check: it exists so a future
+    // change to a shorter lifetime fails the suite instead of silently shrinking the
+    // settlement window (gap analysis §6 hazard 5).
+    #[allow(clippy::assertions_on_constants)]
     fn default_lifetime_outlives_any_session_by_a_wide_margin() {
         // §6 hazard 5: the payee must settle before expiry, and the payer must not
         // race it. A session is minutes; a day is three orders of magnitude of slack.

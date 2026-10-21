@@ -13,7 +13,6 @@
 use crate::http::mac::{HEADER_CLAIM_IGNORED, HEADER_CLIENT_MAC};
 use crate::http::AppState;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
 use std::sync::Arc;
 
 fn state() -> AppState {
@@ -32,6 +31,7 @@ fn state() -> AppState {
         quotes: Arc::new(std::sync::Mutex::new(
             crate::http::routes::quote::MintQuoteRegistry::new(),
         )),
+        spilman: None,
     }
 }
 

@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+#[allow(clippy::field_reassign_with_default)]
 fn app() -> axum::Router {
     let mut cfg = crate::config::schema::Config::default();
     cfg.metric = "bytes".to_string();
@@ -32,6 +33,7 @@ fn app() -> axum::Router {
         quotes: std::sync::Arc::new(std::sync::Mutex::new(
             crate::http::routes::quote::MintQuoteRegistry::new(),
         )),
+        spilman: None,
     };
     crate::http::create_test_router(state)
 }

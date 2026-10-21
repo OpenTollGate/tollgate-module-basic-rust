@@ -10,6 +10,7 @@
 //!      (`<expiry> <mac> <ip> <hostname> <clientid>`)
 //!   2. kernel ARP table — catches static-IP clients and survives a dnsmasq
 //!      restart (`<ip> <hwtype> <flags> <mac> <mask> <device>`)
+//!
 //! A `mac` claim from the request is IGNORED when it contradicts the table: it is
 //! client-controlled, so honouring it would let any caller impersonate a paying
 //! device.

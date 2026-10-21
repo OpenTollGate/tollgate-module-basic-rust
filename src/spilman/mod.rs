@@ -31,6 +31,7 @@ pub mod ledger;
 pub mod payer;
 pub mod payment_units;
 pub mod pricing;
+pub mod rail;
 
 use async_trait::async_trait;
 
@@ -40,6 +41,7 @@ pub use pricing::{
     TOLLGATE_PARITY_IN_BYTES_PER_MILLISAT, TOLLGATE_PRICE_PER_STEP_MILLISATS,
     TOLLGATE_STEP_SIZE_BYTES,
 };
+pub use rail::SpilmanRail;
 
 /// Errors produced by the Spilman rail.
 ///
@@ -100,6 +102,10 @@ pub enum RailDecision {
 ///
 /// Async because a real rail may need to flush a durable write; the no-op rail is
 /// async-identical so callers never branch on the implementor.
+// `async_trait`'s expansion re-applies `#[must_use]` to the desugared methods,
+// which already return `#[must_use]` types. It is generated code, not ours, so the
+// lint is allowed here rather than restructured around.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PaymentRail: Send + Sync + std::fmt::Debug {
     /// Stable name for logs and `/spilman/params`-style diagnostics.

@@ -17,6 +17,12 @@ pub struct AppState {
     pub sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
     /// A5: mint quotes created by `/ln-invoice`.
     pub quotes: Arc<std::sync::Mutex<crate::http::routes::quote::MintQuoteRegistry>>,
+    /// The wholesale Spilman rail, or `None` when `spilman.enabled` is false.
+    ///
+    /// `None` is the whole "zero behavioural change" mechanism: with the rail off
+    /// there is no object to consult, no `/spilman` router to mount, and the
+    /// retail path (`wallet`, `handle_pay`) is not touched at all.
+    pub spilman: Option<Arc<crate::spilman::SpilmanRail>>,
 }
 
 /// Build the main HTTP router with all routes.
@@ -53,7 +59,7 @@ pub fn create_router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    let router = Router::new()
         .route(
             "/",
             axum::routing::get(routes::discovery::handle_discovery).post(routes::pay::handle_pay),
@@ -93,8 +99,9 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             stamp_identity,
         ))
-        .layer(cors)
-        .with_state(state)
+        .layer(cors);
+
+    router.with_state(state)
 }
 
 /// Test-only router with a mocked ConnectInfo, so handler tests can drive the
@@ -108,7 +115,6 @@ pub fn create_test_router_at(state: AppState, addr: std::net::SocketAddr) -> Rou
 #[cfg(test)]
 pub fn create_test_router(state: AppState) -> Router {
     use axum::extract::connect_info::MockConnectInfo;
-    use axum::extract::{ConnectInfo, State};
     create_router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
         [192, 168, 1, 50],
         44444,
@@ -123,3 +129,4 @@ mod parity_routes_test;
 
 #[cfg(test)]
 mod wire_identity_test;
+

@@ -21,6 +21,7 @@ fn mint(url: &str, price: u64, unit: &str) -> MintConfig {
     m
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn cfg(mints: Vec<MintConfig>) -> Config {
     let mut c = Config::default();
     c.metric = "bytes".to_string();

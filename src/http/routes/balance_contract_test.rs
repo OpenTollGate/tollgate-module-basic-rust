@@ -40,6 +40,7 @@ fn empty_state() -> AppState {
         quotes: Arc::new(Mutex::new(
             crate::http::routes::quote::MintQuoteRegistry::new(),
         )),
+        spilman: None,
     }
 }
 
