@@ -28,6 +28,7 @@
 
 pub mod billing;
 pub mod ledger;
+pub mod payer;
 pub mod payment_units;
 pub mod pricing;
 

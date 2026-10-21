@@ -17,8 +17,7 @@ name = "tollgate-module-basic-rust"
 path = "src/main.rs"
 
 [dependencies]
-# P1: durable sessions/quotes. Already in the lock via cdk-sqlite, so this
-# adds no new code to build — it only makes the existing crate addressable.
+# P1: durable sessions/quotes. No new build cost — cdk-sqlite already pulls this in.
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time", "io-util", "fs", "process"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -43,7 +42,8 @@ cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", pac
 cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cashu", default-features = false }
 
 # Spilman payment channels (payment rail). Pinned to the same rev MONAD uses.
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest"] }
+# `client-sqlite` gives `SqliteClientStorage`, the durable payer-side store.
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
 
 # Serde / JSON
 serde = { version = "1", features = ["derive"] }
@@ -66,7 +66,7 @@ sha2 = "0.10"
 
 # Error derive macro
 thiserror = "1"
-# Async trait methods for the PaymentRail seam (already in the lock via cdk-spilman).
+# Async trait methods for the PaymentRail seam.
 async-trait = "0.1"
 hmac = "0.12"
 base64 = "0.23.1"
@@ -74,6 +74,9 @@ bech32 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
+# Only used by `tests/spilman_payer_lifecycle.rs`, an #[ignore]-gated integration
+# test. Same pinned git rev as the main dependency, so it resolves to one crate.
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", package = "cdk-spilman-test-mint" }
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers
