@@ -28,12 +28,22 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
 http-body-util = "0.1"
 
-# Cashu Development Kit (wallet side — we are a wallet talking to mints)
-cdk = { version = "0.18", default-features = false, features = ["wallet"] }
-cdk-sqlite = "0.18"
+# Cashu Development Kit (wallet side — we are a wallet talking to mints).
+#
+# Sourced from git tag v0.18.1, NOT crates.io 0.18.2. `cdk-spilman` depends on
+# `cashu` from this exact git tag, and cargo treats a git source and a registry
+# source as distinct crates — mixing them yields two nominal `Proof` types that
+# cannot be passed to each other. crates.io `cdk-common 0.18.2` pins
+# `cashu = "=0.18.2"` exactly, so `[patch.crates-io]` cannot reconcile it either.
+# Moving the whole stack to the one git source is the only fix that unifies them.
+cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cdk", default-features = false, features = ["wallet"] }
+cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cdk-sqlite", default-features = false, features = ["wallet"] }
 
 # Cashu protocol primitives (Token parsing, NUT types)
-cashu = "0.18"
+cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cashu", default-features = false }
+
+# Spilman payment channels (payment rail). Pinned to the same rev MONAD uses.
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest"] }
 
 # Serde / JSON
 serde = { version = "1", features = ["derive"] }
