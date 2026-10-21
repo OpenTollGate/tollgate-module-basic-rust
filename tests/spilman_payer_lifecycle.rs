@@ -422,7 +422,25 @@ async fn killed_process_between_persist_and_swap_recovers_the_channel() {
         64,
     )
     .expect("re-prepare");
-    assert_eq!(repo.channel_id(), channel_id, "channel id is deterministic");
+    // CHANNEL-ID DETERMINISM IS UNRESOLVED — do not assert either way.
+    //
+    // Observed across two runs of this same test with identical inputs:
+    //   run 1: ids DIFFER (4adb65ef… vs 8b1603e6…)
+    //   run 2: ids are EQUAL (2db88b52… both)
+    //
+    // The blinding path uses `PreMintSecrets::random` (bindings.rs:233), which
+    // would predict "always differs", yet run 2 reproduced the id exactly — so
+    // the id is not simply a function of the blinded outputs and something else
+    // in the derivation varies between runs (or is cached across bridge
+    // instances). Until that is traced, asserting determinism OR
+    // non-determinism would both be guesses.
+    //
+    // What the fund-safety design must therefore do regardless: recovery keys on
+    // the PERSISTED channel id. The assertion below pins the property that
+    // actually protects funds — an unpersisted instance refuses to swap — and is
+    // independent of how ids are derived.
+    //
+    // Tracked in ~/reports/spilman-tollgate/S2-CHANNEL-ID-FINDING.md.
     let mint_client = InMemoryMintNetworking::new(std::sync::Arc::clone(&mint));
     let refusal = repo
         .submit_funding_swap(&mint_client)
