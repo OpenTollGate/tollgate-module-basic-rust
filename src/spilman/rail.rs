@@ -21,15 +21,28 @@
 //! equivalent" comparison here is how a payee ends up serving a byte the payer's
 //! signature does not cover.
 //!
-//! Fail-closed everywhere: an unknown channel, an unreadable ledger, or an
-//! unsupported unit all `Deny`. None of them may be read as "no charge".
+//! # Authenticity, and why it is not the ledger's job
+//!
+//! `record_payment` **verifies before it writes**, using upstream's own
+//! `SpilmanBridge::validate_payment` against the channel's persisted funding record
+//! (see [`super::payee_host`]). The ledger's compare-and-swap answers a different
+//! question — "is this newly accepted funds, or a replay?" — and monotonicity is
+//! not authenticity: a *higher* balance from anyone used to be accepted for any
+//! channel id (`CRITICAL-UNVERIFIED-PAYMENT.md`). Both checks are required, in that
+//! order.
+//!
+//! Fail-closed everywhere: an unknown channel, an unreadable ledger, an
+//! unsupported unit, or a signature that does not verify all `Deny` or refuse.
+//! None of them may be read as "no charge".
 
 use std::path::Path;
 
 use async_trait::async_trait;
+use cdk_spilman::SpilmanBridge;
 
 use crate::config::schema::SpilmanConfig;
 use crate::spilman::ledger::{ChannelLedger, LedgerOutcome};
+use crate::spilman::payee_host::LedgerPayeeHost;
 use crate::spilman::payment_units::raw_units_to_msats;
 use crate::spilman::pricing::SessionPricing;
 use crate::spilman::{PaymentRail, RailDecision, SpilmanError};
@@ -101,9 +114,9 @@ impl SpilmanRail {
 
     /// TEST-ONLY escape hatch past signature verification.
     ///
-    /// `record_payment` deliberately refuses every payment until this payee holds a
-    /// per-channel funding record it can verify a signature against (see
-    /// `CRITICAL-UNVERIFIED-PAYMENT.md`). That refusal is correct, but it also means
+    /// `record_payment` refuses every payment for a channel with no funding record
+    /// (see `CRITICAL-UNVERIFIED-PAYMENT.md` and
+    /// [`SpilmanRail::record_payment`]). That refusal is correct, but it also means
     /// the *credit arithmetic* — "1 sat of balance buys exactly 22,021,000 bytes" —
     /// would become untestable through the public path, and untested arithmetic is
     /// how a payee serves a byte nobody paid for.
@@ -178,27 +191,54 @@ impl PaymentRail for SpilmanRail {
         balance: u64,
         signature: &str,
     ) -> Result<LedgerOutcome, SpilmanError> {
-        // FAIL CLOSED until authenticity is verifiable.
+        // ORDERING (the rule this rail lives by): AUTHENTICATE, then persist.
         //
-        // Spilman payment authenticity is checked against the channel's funding
-        // params, funding proofs, channel secret and keyset info (upstream
-        // `SpilmanBridge::verify_signature`, reached via `validate_payment`,
-        // bridge.rs:1312-1345). This payee does not yet hold a funding record per
-        // channel, so there is nothing to verify against — and a balance-op-only
-        // ledger will happily accept a FORGED balance from anyone for any channel
-        // id, then treat it as the CAS baseline.
+        // 1. Load the channel's funding record. Absent -> UnknownChannel, the same
+        //    fail-closed refusal this arm returned while the record did not exist at
+        //    all. An unknown channel has nothing to verify against, and "no record"
+        //    must never be read as "no capacity".
+        if self.ledger.get_channel_funding(channel_id)?.is_none() {
+            return Err(SpilmanError::UnknownChannel {
+                channel_id: channel_id.to_string(),
+            });
+        }
+
+        // 2. Verify with UPSTREAM'S OWN validator — not a re-implementation.
         //
-        // Found by the host E2E: `{"channel_id":"deadbeef","balance":5,
-        // "signature":"00"}` on a channel that was never funded returned
-        // `200 Accepted`. See CRITICAL-UNVERIFIED-PAYMENT.md.
+        //    `SpilmanBridge::validate_payment` (bridge.rs:1312) re-derives the
+        //    channel from the persisted params, funding proofs, channel secret and
+        //    keyset info, refuses a balance above capacity, and verifies the sender's
+        //    Schnorr signature over `(channel_id, balance)`. The host it runs against
+        //    is `LedgerPayeeHost`, i.e. this same durable ledger.
         //
-        // Refusing is strictly safer than accepting: the payee serves no bytes and
-        // loses nothing, whereas accepting hands out credit it cannot collect. The
-        // real fix is to persist the funding record at open and call the upstream
-        // validator here; until then this arm must stay closed.
-        let _ = (balance, signature);
-        Err(SpilmanError::UnknownChannel {
-            channel_id: channel_id.to_string(),
-        })
+        //    Refusing on ANY error is the whole fix: before it, the ledger checked
+        //    monotonicity only, so `{"channel_id":"deadbeef","balance":5,
+        //    "signature":"00"}` minted credit for anyone (CRITICAL-UNVERIFIED-PAYMENT.md).
+        let host = LedgerPayeeHost::new(&self.ledger);
+        let bridge = SpilmanBridge::new(host);
+        // The context is `String` (this rail's host is `SpilmanHost<String>`); the
+        // payee's own byte accounting is driven by `authorize_bytes`, not here.
+        let context = String::new();
+        bridge
+            .validate_payment(channel_id, balance, signature, &context)
+            .map_err(|e| {
+                tracing::warn!(
+                    channel_id,
+                    balance,
+                    error = %e,
+                    "spilman payment failed verification; refusing to credit it"
+                );
+                SpilmanError::PaymentNotVerified {
+                    channel_id: channel_id.to_string(),
+                    balance,
+                    detail: e.to_string(),
+                }
+            })?;
+
+        // 3. Only now the durable write — and it stays CAS (exact previous balance),
+        //    because authenticity and "not a replay" are different questions: a
+        //    re-sent valid signature verifies perfectly and must still not be credited
+        //    twice.
+        self.ledger.record_payment(channel_id, balance, signature)
     }
 }
