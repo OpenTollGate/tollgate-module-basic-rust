@@ -79,6 +79,18 @@ pub enum SpilmanError {
     #[error("spilman bridge error: {0}")]
     Bridge(String),
 
+    /// A payment was offered for a channel this payee has no funding record for.
+    ///
+    /// Spilman payment authenticity is verified against the channel's funding
+    /// params, funding proofs, channel secret and keyset info. Without that record
+    /// there is **nothing to verify against**, so the payment cannot be accepted —
+    /// see `CRITICAL-UNVERIFIED-PAYMENT.md`. This is a refusal, not an error in the
+    /// request: the caller may open a channel first.
+    #[error(
+        "channel {channel_id} has no funding record; cannot verify the balance signature, refusing to credit it"
+    )]
+    UnknownChannel { channel_id: String },
+
     #[error("spilman config error: {0}")]
     Config(String),
 }

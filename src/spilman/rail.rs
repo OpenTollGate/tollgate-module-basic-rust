@@ -150,6 +150,27 @@ impl PaymentRail for SpilmanRail {
         balance: u64,
         signature: &str,
     ) -> Result<LedgerOutcome, SpilmanError> {
-        self.ledger.record_payment(channel_id, balance, signature)
+        // FAIL CLOSED until authenticity is verifiable.
+        //
+        // Spilman payment authenticity is checked against the channel's funding
+        // params, funding proofs, channel secret and keyset info (upstream
+        // `SpilmanBridge::verify_signature`, reached via `validate_payment`,
+        // bridge.rs:1312-1345). This payee does not yet hold a funding record per
+        // channel, so there is nothing to verify against — and a balance-op-only
+        // ledger will happily accept a FORGED balance from anyone for any channel
+        // id, then treat it as the CAS baseline.
+        //
+        // Found by the host E2E: `{"channel_id":"deadbeef","balance":5,
+        // "signature":"00"}` on a channel that was never funded returned
+        // `200 Accepted`. See CRITICAL-UNVERIFIED-PAYMENT.md.
+        //
+        // Refusing is strictly safer than accepting: the payee serves no bytes and
+        // loses nothing, whereas accepting hands out credit it cannot collect. The
+        // real fix is to persist the funding record at open and call the upstream
+        // validator here; until then this arm must stay closed.
+        let _ = (balance, signature);
+        Err(SpilmanError::UnknownChannel {
+            channel_id: channel_id.to_string(),
+        })
     }
 }
