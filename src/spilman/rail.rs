@@ -98,6 +98,34 @@ impl SpilmanRail {
     pub fn in_bytes_per_millisat(&self) -> u64 {
         self.pricing.in_bytes_per_millisat
     }
+
+    /// TEST-ONLY escape hatch past signature verification.
+    ///
+    /// `record_payment` deliberately refuses every payment until this payee holds a
+    /// per-channel funding record it can verify a signature against (see
+    /// `CRITICAL-UNVERIFIED-PAYMENT.md`). That refusal is correct, but it also means
+    /// the *credit arithmetic* — "1 sat of balance buys exactly 22,021,000 bytes" —
+    /// would become untestable through the public path, and untested arithmetic is
+    /// how a payee serves a byte nobody paid for.
+    ///
+    /// This exposes the ledger's own operation so the arithmetic can still be
+    /// exercised, WITHOUT weakening the production refusal: it is behind the
+    /// `test-support` feature, which is NOT in the default feature set, so a shipped
+    /// binary does not contain it. Any production caller that wants to record a
+    /// balance must go through `record_payment` and earn its signature check.
+    ///
+    /// (It cannot be `#[cfg(test)]`: integration tests in `tests/` are a separate
+    /// crate and cannot see test-cfg items of the library.)
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn record_payment_for_tests(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+    ) -> Result<LedgerOutcome, SpilmanError> {
+        self.ledger.record_payment(channel_id, balance, signature)
+    }
 }
 
 #[async_trait]

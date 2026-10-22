@@ -16,6 +16,15 @@ path = "src/lib.rs"
 name = "tollgate-module-basic-rust"
 path = "src/main.rs"
 
+[features]
+# NOT in the default set, so a shipped binary does not contain the test seam.
+# Enables `SpilmanRail::record_payment_for_tests`, which bypasses signature
+# verification so the credit ARITHMETIC stays testable while the production
+# `record_payment` refuses unverified payments (CRITICAL-UNVERIFIED-PAYMENT.md).
+# Integration tests in tests/ are a separate crate, so they cannot use
+# #[cfg(test)] items of the library — hence a feature rather than cfg(test).
+test-support = []
+
 [dependencies]
 # P1: durable sessions/quotes. No new build cost — cdk-sqlite already pulls this in.
 rusqlite = { version = "0.31", features = ["bundled"] }

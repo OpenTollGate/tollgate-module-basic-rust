@@ -55,6 +55,7 @@ fn enabled_config_builds_a_rail() {
 /// channel is denied (never "assume zero due"), a recorded balance buys exactly the
 /// bytes it pays for at the 22_021 parity rate, and a replay is refused.
 #[tokio::test]
+#[cfg(feature = "test-support")]
 async fn rail_credits_exactly_what_was_recorded() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("spilman.db");
@@ -71,8 +72,15 @@ async fn rail_credits_exactly_what_was_recorded() {
     );
 
     // 22_021 bytes is exactly 1 msat, which rounds up to 1 sat of raw balance.
-    rail.record_payment("c", 1, "sig-1")
-        .await
+    //
+    // This goes through the TEST-ONLY ledger seam, not `record_payment`: the
+    // production path deliberately refuses every payment until a per-channel
+    // funding record exists to verify a signature against (see
+    // CRITICAL-UNVERIFIED-PAYMENT.md). The refusal is pinned separately in
+    // tests/spilman_payment_authenticity.rs; what is under test HERE is the credit
+    // arithmetic, which must stay exercised or a payee could serve a byte nobody
+    // paid for.
+    rail.record_payment_for_tests("c", 1, "sig-1")
         .expect("first payment is durable");
     assert_eq!(
         rail.authorize_bytes("c", 22_021, 0).await,
@@ -93,7 +101,7 @@ async fn rail_credits_exactly_what_was_recorded() {
     );
 
     // Replay of the same balance is not newly accepted funds.
-    assert!(rail.record_payment("c", 1, "sig-1").await.is_err());
+    assert!(rail.record_payment_for_tests("c", 1, "sig-1").is_err());
     // A rollback is refused too.
-    assert!(rail.record_payment("c", 0, "sig-0").await.is_err());
+    assert!(rail.record_payment_for_tests("c", 0, "sig-0").is_err());
 }
