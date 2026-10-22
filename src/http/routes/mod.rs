@@ -16,6 +16,7 @@ mod pay_notice_test;
 mod pay_session_test;
 pub mod quote;
 pub mod select;
+pub mod spilman;
 #[cfg(test)]
 mod select_test;
 pub mod usage;

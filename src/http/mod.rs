@@ -94,7 +94,19 @@ pub fn create_router(state: AppState) -> Router {
             "/ln-invoice",
             axum::routing::post(routes::ln_invoice::handle_create_ln_invoice)
                 .get(routes::ln_invoice::handle_get_ln_invoice),
-        )
+        );
+
+    // The `/spilman` channel surface exists ONLY when the rail does. This is the
+    // observable half of "enabled: false changes nothing": with the rail off no
+    // route is mounted at all, so every `/spilman/*` path answers 404 without any
+    // handler ever running. Pinned by src/http/spilman_mount_test.rs.
+    let router = if state.spilman.is_some() {
+        router.nest("/spilman", routes::spilman::spilman_router())
+    } else {
+        router
+    };
+
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             stamp_identity,
@@ -126,6 +138,9 @@ mod identity_test;
 
 #[cfg(test)]
 mod parity_routes_test;
+
+#[cfg(test)]
+mod spilman_mount_test;
 
 #[cfg(test)]
 mod wire_identity_test;
