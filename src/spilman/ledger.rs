@@ -61,6 +61,45 @@ pub enum LedgerOutcome {
     Accepted,
 }
 
+/// A durable per-channel **funding** record — the payee's half of a Spilman channel.
+///
+/// This is what `cdk-spilman` verifies a balance signature against, and it is why
+/// the balance table alone cannot authenticate anything: monotonicity is not
+/// authenticity (`CRITICAL-UNVERIFIED-PAYMENT.md`). Upstream
+/// `SpilmanBridge::validate_payment` (bridge.rs:1312) loads exactly these five
+/// values through `SpilmanHost::get_funding` and feeds them to
+/// `verify_signature`:
+///
+/// - `params_json` + `keyset_info_json` + `channel_secret_hex` reconstruct the
+///   channel (`ChannelParameters::from_json_with_channel_secret`);
+/// - `funding_proofs_json` reconstructs the `EstablishedChannel` the sender's key
+///   is derived from;
+/// - `capacity` bounds the largest balance that may be signed.
+///
+/// # Why the round-trip must be byte-exact
+///
+/// Every field is stored and read back verbatim. A field that came back even one
+/// byte different would either make verification fail (a funded channel that can
+/// never be paid — a denial of service on money) or, far worse, verify the
+/// signature against *different* params than the channel was opened with. There is
+/// no re-serialisation step in either direction for that reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelFundingRecord {
+    pub channel_id: String,
+    /// Serialized channel parameters, verbatim as the payer registered them.
+    pub params_json: String,
+    /// Serialized funding proofs, verbatim.
+    pub funding_proofs_json: String,
+    /// Hex-encoded ECDH channel secret.
+    pub channel_secret_hex: String,
+    /// Serialized keyset info for the channel's keyset, verbatim.
+    pub keyset_info_json: String,
+    /// Largest balance the payer may sign for this channel.
+    pub capacity: u64,
+    /// When the record was written (unix seconds).
+    pub created_at: u64,
+}
+
 /// SQLite-backed channel balance ledger.
 #[derive(Debug)]
 pub struct ChannelLedger {
@@ -119,6 +158,18 @@ impl ChannelLedger {
                  signature     TEXT    NOT NULL,
                  payment_count INTEGER NOT NULL,
                  updated_at    INTEGER NOT NULL
+             ) STRICT;
+             -- The payee's funding record. Without a row here a payment for the
+             -- channel cannot be authenticated at all, so `record_payment` fails
+             -- closed (UnknownChannel). See ChannelFundingRecord.
+             CREATE TABLE IF NOT EXISTS spilman_channel_funding (
+                 channel_id          TEXT    PRIMARY KEY,
+                 params_json         TEXT    NOT NULL,
+                 funding_proofs_json TEXT    NOT NULL,
+                 channel_secret_hex  TEXT    NOT NULL,
+                 keyset_info_json    TEXT    NOT NULL,
+                 capacity            INTEGER NOT NULL,
+                 created_at          INTEGER NOT NULL
              ) STRICT;",
         )
         .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
@@ -266,6 +317,74 @@ impl ChannelLedger {
             .map(|p| p.payment_count)
             .unwrap_or(0))
     }
+
+    // -- channel funding -----------------------------------------------------
+
+    /// The durable funding record for a channel, or `None` if it was never funded.
+    ///
+    /// `None` means "this payee cannot verify anything about this channel", and the
+    /// rail turns it into a refusal ([`SpilmanError::UnknownChannel`]). It must never
+    /// be read as "no capacity" or "zero balance": an absent record is a *different
+    /// fact* from a funded channel at balance 0.
+    pub fn get_channel_funding(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<ChannelFundingRecord>, SpilmanError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT channel_id, params_json, funding_proofs_json, channel_secret_hex,
+                    keyset_info_json, capacity, created_at
+               FROM spilman_channel_funding
+              WHERE channel_id = ?1",
+            [channel_id],
+            |row| {
+                Ok(ChannelFundingRecord {
+                    channel_id: row.get(0)?,
+                    params_json: row.get(1)?,
+                    funding_proofs_json: row.get(2)?,
+                    channel_secret_hex: row.get(3)?,
+                    keyset_info_json: row.get(4)?,
+                    capacity: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| SpilmanError::Ledger(e.to_string()))
+    }
+
+    /// Persist a channel's funding record. **First write wins.**
+    ///
+    /// Re-registering an existing channel is a no-op rather than an overwrite, and
+    /// deliberately so: the funding params carry the `capacity` ceiling and the
+    /// channel secret the signature is checked against. Letting a second
+    /// registration replace them would let anyone who can reach the surface raise
+    /// the ceiling on a channel that is already open — i.e. re-open the forgery this
+    /// whole path exists to close.
+    ///
+    /// Idempotency is also what makes the legitimate retry harmless: a payer whose
+    /// first registration response was lost re-sends the identical record, and
+    /// `INSERT OR IGNORE` accepts it without changing stored state.
+    pub fn save_channel_funding(&self, record: &ChannelFundingRecord) -> Result<(), SpilmanError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO spilman_channel_funding
+                 (channel_id, params_json, funding_proofs_json, channel_secret_hex,
+                  keyset_info_json, capacity, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                record.channel_id,
+                record.params_json,
+                record.funding_proofs_json,
+                record.channel_secret_hex,
+                record.keyset_info_json,
+                record.capacity,
+                record.created_at,
+            ],
+        )
+        .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+        Ok(())
+    }
 }
 
 fn now_seconds() -> u64 {
@@ -307,5 +426,81 @@ mod tests {
         let ledger = ChannelLedger::open_in_memory().expect("open");
         assert!(ledger.record_payment("c", 0, "s0").is_err());
         assert_eq!(ledger.get_balance("c").expect("query"), None);
+    }
+
+    /// A record with content a lossy round-trip would silently corrupt: embedded
+    /// quotes, backslashes, newlines and non-ASCII, in every one of the five fields.
+    ///
+    /// If any field were, say, encoded through a lossy UTF-8 step or re-serialised
+    /// through a `{:?}`/`Display` instead of stored raw, the read-back would differ
+    /// by a byte and verification would fail — or verify against the wrong params.
+    fn adversarial_record(channel_id: &str) -> ChannelFundingRecord {
+        ChannelFundingRecord {
+            channel_id: channel_id.to_string(),
+            params_json: "{\"capacity\":1000,\"note\":\"a\\\"b\\\\c\\nd\\u00e9\"}".to_string(),
+            funding_proofs_json: "[{\"c\":\"\\u00df\\t\\\\\"}]".to_string(),
+            channel_secret_hex: "0".repeat(63) + "a",
+            keyset_info_json: "{\"id\":\"00adcaf3\\u00e9\\\\\"}".to_string(),
+            capacity: 1000,
+            created_at: 1_700_000_123,
+        }
+    }
+
+    #[test]
+    fn an_unknown_channel_has_no_funding_record() {
+        let ledger = ChannelLedger::open_in_memory().expect("open");
+        assert_eq!(
+            ledger.get_channel_funding("never-funded").expect("query"),
+            None,
+            "a channel with no funding record must report None, not a defaulted record"
+        );
+    }
+
+    #[test]
+    fn a_stored_funding_record_survives_a_reopen_byte_identically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spilman.db");
+
+        let original = adversarial_record("chan-funding-roundtrip");
+        ChannelLedger::open(&path)
+            .expect("open for write")
+            .save_channel_funding(&original)
+            .expect("store the funding record");
+
+        // Read it back through a *different* connection to the same file, so the
+        // assertion cannot be satisfied by an in-process cache.
+        let reopened = ChannelLedger::open(&path)
+            .expect("reopen")
+            .get_channel_funding("chan-funding-roundtrip")
+            .expect("query")
+            .expect("the record must be durable");
+
+        assert_eq!(
+            reopened, original,
+            "a funding record must round-trip byte-identically, or verification checks the wrong bytes"
+        );
+    }
+
+    #[test]
+    fn storing_a_funding_record_twice_keeps_the_first() {
+        let ledger = ChannelLedger::open_in_memory().expect("open");
+
+        let first = adversarial_record("c");
+        let mut second = first.clone();
+        second.params_json = "{\"capacity\":999999}".to_string();
+        second.capacity = 999_999;
+
+        ledger.save_channel_funding(&first).expect("store first");
+        ledger.save_channel_funding(&second).expect("store second");
+
+        let stored = ledger
+            .get_channel_funding("c")
+            .expect("query")
+            .expect("present");
+        assert_eq!(
+            stored, first,
+            "re-registering a channel must not swap its funding params — that would move the \
+             capacity ceiling the signature is checked against"
+        );
     }
 }
