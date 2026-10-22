@@ -16,6 +16,17 @@ path = "src/lib.rs"
 name = "tollgate-module-basic-rust"
 path = "src/main.rs"
 
+# A TEST DRIVER, not a product feature: it opens a channel against an in-process
+# test mint, registers it with a *running* payee over HTTP, pays it, and reads the
+# result back. An *example* rather than a `[[bin]]`, because an example may use
+# dev-dependencies — which is exactly where the in-process test mint lives. That
+# keeps the test mint out of every shipped artifact, and `required-features` keeps
+# the driver itself out of a plain `cargo build`/`cargo test`.
+[[example]]
+name = "spilman-payer"
+path = "examples/spilman_payer.rs"
+required-features = ["payer-driver"]
+
 [features]
 # NOT in the default set, so a shipped binary does not contain the test seam.
 # Enables `SpilmanRail::record_payment_for_tests`, which bypasses signature
@@ -24,6 +35,11 @@ path = "src/main.rs"
 # Integration tests in tests/ are a separate crate, so they cannot use
 # #[cfg(test)] items of the library — hence a feature rather than cfg(test).
 test-support = []
+
+# Opts the `spilman-payer` example into the build. Off by default: a test driver
+# is not something a router image should carry, and it needs no dependency of its
+# own (the test mint is already a dev-dependency, visible to examples).
+payer-driver = []
 
 [dependencies]
 # P1: durable sessions/quotes. No new build cost — cdk-sqlite already pulls this in.
@@ -83,8 +99,9 @@ bech32 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
-# Only used by `tests/spilman_payer_lifecycle.rs`, an #[ignore]-gated integration
-# test. Same pinned git rev as the main dependency, so it resolves to one crate.
+# Used by the #[ignore]-gated integration tests and by the `examples/spilman_payer.rs`
+# driver. A dev-dependency precisely so it cannot reach a shipped artifact. Same
+# pinned git rev as the main dependency, so it resolves to one crate.
 cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", package = "cdk-spilman-test-mint" }
 
 [profile.release]

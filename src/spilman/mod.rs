@@ -30,13 +30,17 @@ pub mod billing;
 pub mod ledger;
 pub mod payee_host;
 pub mod payer;
+pub mod payer_driver;
 pub mod payment_units;
 pub mod pricing;
 pub mod rail;
+pub mod registration;
 
 use async_trait::async_trait;
 
-pub use ledger::{ChannelFundingRecord, ChannelLedger, LedgerOutcome, StoredPayment};
+pub use ledger::{
+    ChannelFundingRecord, ChannelLedger, FundingRegistration, LedgerOutcome, StoredPayment,
+};
 pub use payee_host::LedgerPayeeHost;
 pub use pricing::{
     PricingModel, SessionPricing, StepPricing, DEFAULT_IN_BYTES_PER_MILLISAT,
@@ -44,6 +48,7 @@ pub use pricing::{
     TOLLGATE_STEP_SIZE_BYTES,
 };
 pub use rail::SpilmanRail;
+pub use registration::{validate_registration, ChannelRegistrationRequest};
 
 /// Errors produced by the Spilman rail.
 ///
@@ -109,6 +114,29 @@ pub enum SpilmanError {
         balance: u64,
         detail: String,
     },
+
+    /// A registration body this payee cannot turn into a usable funding record.
+    ///
+    /// Either the JSON is malformed or the pieces contradict each other (params
+    /// that do not reconstruct, an id the bytes do not derive, a capacity that
+    /// disagrees with the params). Nothing is written; refuse at the door rather
+    /// than store a row that can never verify a payment.
+    #[error("invalid channel registration for {channel_id}: {detail}")]
+    InvalidRegistration { channel_id: String, detail: String },
+
+    /// The channel id is already registered with **different** funding data.
+    ///
+    /// The stored record is untouched. A duplicate registration with identical
+    /// data is not this error — it succeeds idempotently
+    /// ([`FundingRegistration::AlreadyRegistered`]) — because the state the payer
+    /// asked for is the state that already exists. This error is reserved for a
+    /// genuine conflict, which is either two payers colliding on an id or someone
+    /// trying to move the capacity ceiling / channel secret a signature is checked
+    /// against.
+    #[error(
+        "channel {channel_id} is already registered with different funding data; refusing to overwrite it"
+    )]
+    ChannelAlreadyRegistered { channel_id: String },
 
     #[error("spilman config error: {0}")]
     Config(String),

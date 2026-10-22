@@ -112,6 +112,69 @@ impl SpilmanRail {
         self.pricing.in_bytes_per_millisat
     }
 
+    /// Register an opened channel: persist the funding record this payee will
+    /// verify future payments against.
+    ///
+    /// # Why this lives on the rail, not in the handler
+    ///
+    /// Same rule as every other `/spilman` decision: the handler translates, the
+    /// rail decides. Registration is where "which bytes may this payee be asked to
+    /// verify against" is settled — a policy question, not a parsing one — so the
+    /// handler passes the request through and reports what came back.
+    ///
+    /// # The security property, stated once
+    ///
+    /// Registration **grants no credit**. It cannot: credit is issued only by
+    /// [`SpilmanRail::record_payment`], which re-derives the channel from this
+    /// record and verifies a BIP-340 signature over `(channel_id, balance)` with
+    /// upstream's own validator before the durable write. So a forged registration
+    /// (a record for a channel the poster does not hold the key for) does not
+    /// inflate a balance — it produces a channel that **refuses every payment**,
+    /// including the forger's. Wrong or unverified input fails closed here by
+    /// construction; there is no path from "registered" to "credited" that skips
+    /// the signature check.
+    ///
+    /// What registration *does* decide is which channel this payee will bother
+    /// looking at, so a garbage record is still worth refusing at the door: a stored
+    /// row that can never verify is a durable denial-of-service on that id.
+    pub fn register_channel(
+        &self,
+        req: &crate::spilman::registration::ChannelRegistrationRequest,
+    ) -> Result<crate::spilman::FundingRegistration, SpilmanError> {
+        // Validate against upstream's own channel reconstruction, then store
+        // compare-and-swap. Validation failure means nothing is written.
+        let record = crate::spilman::registration::validate_registration(req)?;
+        self.ledger.register_channel_funding(&record)
+    }
+
+    /// The funding record this payee holds for a channel, if any.
+    ///
+    /// Used by the tests to assert "the stored record is still the original,
+    /// byte-identical" after a refused overwrite, and by the driver to confirm
+    /// registration landed.
+    pub fn channel_funding(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<crate::spilman::ChannelFundingRecord>, SpilmanError> {
+        self.ledger.get_channel_funding(channel_id)
+    }
+
+    /// Whether this payee knows the channel at all — i.e. holds a funding record.
+    ///
+    /// Distinct from "has credit", and the distinction matters: a channel that was
+    /// just registered has no balance row yet, and reading that absence as "unknown"
+    /// would tell a payer its registration failed when it did not.
+    pub fn is_known_channel(&self, channel_id: &str) -> Result<bool, SpilmanError> {
+        Ok(self.ledger.get_channel_funding(channel_id)?.is_some())
+    }
+
+    /// The durable raw-unit balance for a channel, or `None` when it has none.
+    ///
+    /// `None` (registered, never paid) is deliberately distinct from `Some(0)`.
+    pub fn channel_balance(&self, channel_id: &str) -> Result<Option<u64>, SpilmanError> {
+        self.ledger.get_balance(channel_id)
+    }
+
     /// TEST-ONLY escape hatch past signature verification.
     ///
     /// `record_payment` refuses every payment for a channel with no funding record

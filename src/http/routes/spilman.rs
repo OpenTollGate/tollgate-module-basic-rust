@@ -21,7 +21,7 @@
 
 use crate::http::AppState;
 use crate::spilman::rail::SpilmanRail;
-use crate::spilman::PaymentRail;
+use crate::spilman::{PaymentRail, SpilmanError};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -104,6 +104,132 @@ pub async fn handle_payment(
     }
 }
 
+/// POST /spilman/channel — a payer registers an opened channel.
+///
+/// # Why this route exists
+///
+/// Without it a channel could only be registered **in-process**, so a channel
+/// client talking to a *running* module could never make its channel known and
+/// every payment for it was refused as `UnknownChannel`. This is the missing half
+/// of the payee surface: `/payment` spends credit, `/channel` establishes what
+/// credit will be checked against.
+///
+/// # What the handler does, and does not do
+///
+/// It translates. Every decision — whether the body is a coherent channel, whether
+/// the id is already taken, and whether the store may be written — belongs to
+/// `SpilmanRail::register_channel`. The body fields are the ledger's own names for
+/// the same values (see [`crate::spilman::ledger::ChannelFundingRecord`]), so no
+/// byte is renamed between the wire and the row.
+///
+/// # Security: registration is not a credit-forgery vector
+///
+/// Anyone may POST here; that is deliberate, because the payee cannot know who the
+/// payer is before the payer tells it. It is safe because **registration grants no
+/// credit**. Credit is granted only by [`handle_payment`] →
+/// `SpilmanRail::record_payment`, which re-derives the channel from this record and
+/// verifies a BIP-340 signature over `(channel_id, balance)` before the durable
+/// compare-and-swap. A forged registration therefore buys the forger a channel that
+/// refuses its own payments: wrong bytes make verification **fail**, and a failure
+/// is a refusal, never a default-allow.
+///
+/// Two things follow, and both are intentional rather than oversights:
+///
+/// 1. Registration cannot *raise* a ceiling on an existing channel — a
+///    conflicting record is refused and the stored one is left byte-identical (see
+///    [`SpilmanError::ChannelAlreadyRegistered`]). An identical re-registration is
+///    idempotent so a payer whose response was lost can retry.
+/// 2. Registration does **not** authenticate the registrant. The funding record
+///    names a mint and a keyset, and a payee with no trusted-(mint, keyset) policy
+///    will happily store a self-consistent record for a channel the poster minted
+///    for themselves. That is not a credit hole (the payee still verifies every
+///    payment, so it never serves bytes it was not paid for) but it is an
+///    unauthenticated-write surface, and it is documented in `REPORT.md` rather
+///    than papered over with an invented policy.
+///
+/// # Why the body arrives as raw bytes
+///
+/// axum's `Json` extractor answers **422** for a syntactically valid body whose
+/// shape is wrong (missing/wrong-typed field) while a registration that is merely
+/// semantically impossible is a **400**. Same class of client error, two statuses,
+/// decided by a dependency's internal split. Parsing here keeps one rule, in our
+/// code: any body that cannot become a funding record is 400.
+pub async fn handle_register_channel(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let Some(r) = rail(&state) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "status": 0,
+            "error": "spilman rail is not enabled"
+        }))).into_response();
+    };
+
+    // The only parse in this handler. A body that is not a registration is a
+    // client error (400), never a 500 and never an empty registration.
+    let req: crate::spilman::ChannelRegistrationRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "status": 0,
+                "error": format!("malformed registration body: {e}")
+            }))).into_response()
+        }
+    };
+
+    match r.register_channel(&req) {
+        Ok(outcome) => Json(ChannelRegistrationResponse {
+            status: 1,
+            channel_id: req.channel_id,
+            // "registered" vs "already_registered": both are 200, because in both
+            // cases the record the payer asked for is the record that is durable.
+            // A payer retrying after a lost response must not be told it failed.
+            outcome: match outcome {
+                crate::spilman::FundingRegistration::Registered => "registered".to_string(),
+                crate::spilman::FundingRegistration::AlreadyRegistered => {
+                    "already_registered".to_string()
+                }
+            },
+        })
+        .into_response(),
+        // 409 for "this id exists with different funding data": the request was
+        // well-formed and the answer is "no". Never a silent overwrite.
+        Err(e @ SpilmanError::ChannelAlreadyRegistered { .. }) => {
+            (StatusCode::CONFLICT, Json(serde_json::json!({
+                "status": 0,
+                "error": e.to_string()
+            }))).into_response()
+        }
+        // 400 for a body that cannot become a usable record. Malformed JSON is
+        // rejected by axum's extractor before the handler runs (also 400).
+        Err(e @ SpilmanError::InvalidRegistration { .. }) => {
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "status": 0,
+                "error": e.to_string()
+            }))).into_response()
+        }
+        // A store failure is ours, not the caller's, and it must not read as a
+        // successful registration: 500 with the reason.
+        Err(e) => {
+            tracing::error!(channel_id = %req.channel_id, error = %e,
+                "spilman channel registration failed to persist");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "status": 0,
+                "error": e.to_string()
+            }))).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChannelRegistrationResponse {
+    pub status: u8,
+    pub channel_id: String,
+    /// `registered` (newly stored) or `already_registered` (identical record was
+    /// already durable). Both mean "the record you sent is the record I hold".
+    pub outcome: String,
+}
+
 /// GET /spilman/status?channel_id=... — the payee's view of one channel.
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
@@ -121,26 +247,47 @@ pub async fn handle_status(
         }))).into_response();
     };
 
-    // `authorize_bytes` with zero cumulative bytes asks the only question that
-    // matters for a status read: "is this channel known?" An unknown channel
-    // denies, which we surface as 404 rather than a misleading zero balance.
-    let decision = r.authorize_bytes(&q.channel_id, 0, 0).await;
-    match decision {
-        crate::spilman::RailDecision::Deny => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
+    // "Is this channel known?" is a question about the **funding record**, not the
+    // balance. A channel that has been registered but not yet paid has no balance
+    // row at all, and `authorize_bytes` reads a missing balance as `Deny` — which
+    // is right for "may I serve these bytes" and wrong for "do I know this
+    // channel". Answering 404 for a registered channel would tell a payer its
+    // registration failed when it did not, so the two questions are asked
+    // separately here.
+    let known = match r.is_known_channel(&q.channel_id) {
+        Ok(known) => known,
+        Err(e) => {
+            // An unreadable ledger must not be reported as "unknown": that would
+            // tell a payer its funded channel does not exist.
+            tracing::error!(channel_id = %q.channel_id, error = %e,
+                "spilman funding read failed; refusing to answer /status");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "status": 0,
-                "error": "unknown channel"
-            })),
-        )
-            .into_response(),
-        other => Json(serde_json::json!({
-            "status": 1,
-            "channel_id": q.channel_id,
-            "decision": format!("{other:?}")
-        }))
-        .into_response(),
+                "error": "channel ledger unreadable"
+            })))
+            .into_response();
+        }
+    };
+    if !known {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "status": 0,
+            "error": "unknown channel"
+        })))
+        .into_response();
     }
+
+    // Known: report the credit decision and the balance it is derived from.
+    let decision = r.authorize_bytes(&q.channel_id, 0, 0).await;
+    let balance = r.channel_balance(&q.channel_id).unwrap_or(None);
+    Json(serde_json::json!({
+        "status": 1,
+        "channel_id": q.channel_id,
+        "decision": format!("{decision:?}"),
+        // Raw channel units (sats) currently credited. `null` when the channel is
+        // registered but has never been paid — deliberately distinct from 0.
+        "balance": balance,
+    }))
+    .into_response()
 }
 
 /// Build the `/spilman` sub-router.
@@ -150,6 +297,7 @@ pub async fn handle_status(
 pub fn spilman_router() -> axum::Router<AppState> {
     axum::Router::new()
         .route("/params", axum::routing::get(handle_params))
+        .route("/channel", axum::routing::post(handle_register_channel))
         .route("/payment", axum::routing::post(handle_payment))
         .route("/status", axum::routing::get(handle_status))
 }

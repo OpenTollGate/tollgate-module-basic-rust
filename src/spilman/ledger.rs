@@ -61,6 +61,19 @@ pub enum LedgerOutcome {
     Accepted,
 }
 
+/// What a funding-record registration did.
+///
+/// The two successes are deliberately distinct: a payer whose first registration
+/// response was lost must be able to tell "your record is stored" (it already was)
+/// from "your record was just stored", without either answer being an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FundingRegistration {
+    /// The record was new and is now durable.
+    Registered,
+    /// A byte-identical record was already stored; nothing changed.
+    AlreadyRegistered,
+}
+
 /// A durable per-channel **funding** record — the payee's half of a Spilman channel.
 ///
 /// This is what `cdk-spilman` verifies a balance signature against, and it is why
@@ -365,6 +378,9 @@ impl ChannelLedger {
     /// Idempotency is also what makes the legitimate retry harmless: a payer whose
     /// first registration response was lost re-sends the identical record, and
     /// `INSERT OR IGNORE` accepts it without changing stored state.
+    ///
+    /// Prefer [`Self::register_channel_funding`] on the registration path: this
+    /// one cannot tell "stored" from "ignored", so it cannot answer an honest retry.
     pub fn save_channel_funding(&self, record: &ChannelFundingRecord) -> Result<(), SpilmanError> {
         let conn = self.lock()?;
         conn.execute(
@@ -384,6 +400,98 @@ impl ChannelLedger {
         )
         .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
         Ok(())
+    }
+
+    /// Register a channel's funding record: **refuse to overwrite, ever.**
+    ///
+    /// The three outcomes a caller can distinguish, and why each is what it is:
+    ///
+    /// - `Registered` — the id was new; the record is now durable.
+    /// - `AlreadyRegistered` — a byte-identical record was already stored. This is
+    ///   **success**, not conflict: the state the payer asked for is the state that
+    ///   exists, so rejecting it would make an honest retry indistinguishable from
+    ///   an attack and force the payer to guess why.
+    /// - `Err(ChannelAlreadyRegistered)` — the id exists with *different* funding
+    ///   data. That is either a bug (two payers colliding on an id) or an attack
+    ///   (someone trying to move the capacity ceiling or the secret a signature is
+    ///   checked against). Either way the stored record is left untouched and the
+    ///   caller is told.
+    ///
+    /// Compare-and-store is one `IMMEDIATE` transaction, so two concurrent
+    /// registrations of the same id cannot both be told `Registered`; the loser
+    /// reports `AlreadyRegistered` or the conflict, never a partial write.
+    pub fn register_channel_funding(
+        &self,
+        record: &ChannelFundingRecord,
+    ) -> Result<FundingRegistration, SpilmanError> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+
+        let existing: Option<(String, String, String, String, u64)> = tx
+            .query_row(
+                "SELECT params_json, funding_proofs_json, channel_secret_hex,
+                        keyset_info_json, capacity
+                   FROM spilman_channel_funding
+                  WHERE channel_id = ?1",
+                [&record.channel_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+
+        if let Some((params_json, funding_proofs_json, channel_secret_hex, keyset_info_json, capacity)) =
+            existing
+        {
+            // `created_at` is deliberately NOT compared: it is the payee's own clock,
+            // not the payer's data, so including it would turn every honest retry into
+            // a bogus conflict.
+            let identical = params_json == record.params_json
+                && funding_proofs_json == record.funding_proofs_json
+                && channel_secret_hex == record.channel_secret_hex
+                && keyset_info_json == record.keyset_info_json
+                && capacity == record.capacity;
+
+            // No write in either branch — the transaction is dropped (rolled back) on
+            // return, which is the point: an existing record is never touched.
+            return if identical {
+                Ok(FundingRegistration::AlreadyRegistered)
+            } else {
+                Err(SpilmanError::ChannelAlreadyRegistered {
+                    channel_id: record.channel_id.clone(),
+                })
+            };
+        }
+
+        tx.execute(
+            "INSERT INTO spilman_channel_funding
+                 (channel_id, params_json, funding_proofs_json, channel_secret_hex,
+                  keyset_info_json, capacity, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                record.channel_id,
+                record.params_json,
+                record.funding_proofs_json,
+                record.channel_secret_hex,
+                record.keyset_info_json,
+                record.capacity,
+                record.created_at,
+            ],
+        )
+        .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+
+        tx.commit()
+            .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+        Ok(FundingRegistration::Registered)
     }
 }
 
