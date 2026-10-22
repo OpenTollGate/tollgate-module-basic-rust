@@ -28,6 +28,7 @@
 
 pub mod billing;
 pub mod ledger;
+pub mod payee_host;
 pub mod payer;
 pub mod payment_units;
 pub mod pricing;
@@ -35,7 +36,8 @@ pub mod rail;
 
 use async_trait::async_trait;
 
-pub use ledger::{ChannelLedger, LedgerOutcome, StoredPayment};
+pub use ledger::{ChannelFundingRecord, ChannelLedger, LedgerOutcome, StoredPayment};
+pub use payee_host::LedgerPayeeHost;
 pub use pricing::{
     PricingModel, SessionPricing, StepPricing, DEFAULT_IN_BYTES_PER_MILLISAT,
     TOLLGATE_PARITY_IN_BYTES_PER_MILLISAT, TOLLGATE_PRICE_PER_STEP_MILLISATS,
@@ -90,6 +92,23 @@ pub enum SpilmanError {
         "channel {channel_id} has no funding record; cannot verify the balance signature, refusing to credit it"
     )]
     UnknownChannel { channel_id: String },
+
+    /// The offered balance did not verify against the channel's funding record.
+    ///
+    /// This is the refusal that `CRITICAL-UNVERIFIED-PAYMENT.md` was about: the
+    /// signature was checked by upstream's own `SpilmanBridge::validate_payment`
+    /// against the persisted funding params, funding proofs, channel secret and
+    /// keyset info, and it did not hold — or the balance exceeded the channel's
+    /// capacity, or the channel is closing/closed. `detail` carries upstream's
+    /// reason so the refusal is diagnosable without a debugger.
+    #[error(
+        "channel {channel_id} payment of balance {balance} did not verify ({detail}); refusing to credit it"
+    )]
+    PaymentNotVerified {
+        channel_id: String,
+        balance: u64,
+        detail: String,
+    },
 
     #[error("spilman config error: {0}")]
     Config(String),
