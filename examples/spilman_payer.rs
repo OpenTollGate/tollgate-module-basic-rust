@@ -6,33 +6,77 @@
 //!
 //! ```text
 //! 1. GET  /spilman/params    read the payee's mint + rate
-//! 2. (local)                 open a channel against that mint, fund it
+//! 2. (mint, over HTTP)       open a channel against that mint, fund it
 //! 3. POST /spilman/channel   register the funding record with the payee
 //! 4. POST /spilman/payment   sign a balance update and pay
 //! 5. GET  /spilman/status    read back what the payee credited
 //! ```
 //!
+//! # The CLI is a contract with the bench lane
+//!
+//! `spilman_router_lane.py` (the PRTA router lane) launches this binary as
+//!
+//! ```text
+//! ./spilman-payer --mint-url <mint> --module-url <base> --flow open-settle
+//! ```
+//!
+//! so those are the flags, spelled exactly: `--mint-url`, `--mint-file` (read the
+//! URL from a file instead), `--module-url`, and `--flow`. `--payee` is kept as an
+//! alias for `--module-url` because earlier runs and the docs used it. Anything
+//! else is a usage error and exits **2**, which the lane reports as "the two
+//! halves disagree on the interface" rather than as a protocol failure.
+//!
+//! # Funding is real HTTP, at the URL it was given
+//!
+//! The mint leg lives in the library (`spilman::mint_http`, behind the same
+//! non-default `payer-driver` feature as this example) and talks NUT-04 over the
+//! wire to whatever `--mint-url` names. It does **not** spawn an in-process test
+//! mint. Two reasons, and the second is the load-bearing one:
+//!
+//! - the driver should be the protocol orchestration, not a second mint
+//!   implementation with its own test-only behaviour;
+//! - the lane measures "ZERO mint calls between open and settle" with a
+//!   **counting proxy** in front of the mint, and advertises *the proxy's* URL
+//!   through the payee's `/spilman/params`. A driver minting at an ephemeral
+//!   loopback port bypasses that proxy entirely, so the proxy would count zero
+//!   no matter what the payer did — the assertion could not fail, which means it
+//!   was measuring nothing. Funding at the URL passed in is what makes it a
+//!   measurement.
+//!
 //! # Why it is an example, not a `[[bin]]`
 //!
-//! It needs the in-process `cdk-spilman-test-mint`, which is a **dev-dependency**.
-//! A `[[bin]]` cannot use dev-dependencies; an example can. Making it a bin would
-//! force the test mint into the dependency graph of every shipped artifact — a
-//! router image carrying a fake mint is exactly the kind of thing that later gets
-//! switched on by accident. It is additionally behind `required-features =
-//! ["payer-driver"]`, so a plain `cargo build` / `cargo test` neither builds nor
-//! installs it.
+//! It is behind `required-features = ["payer-driver"]`, so a plain `cargo build`,
+//! `cargo test`, or release image neither builds nor installs it. That matters
+//! more now than when this was written: the funding leg asks a mint for ecash,
+//! and a router binary carrying a "fund me" routine is exactly the kind of thing
+//! that later gets switched on by accident. The in-process test mint remains a
+//! **dev-dependency only**, for the `#[ignore]`-gated integration tests; this
+//! example no longer references it.
 //!
 //! # Running it
 //!
 //! ```text
-//! # terminal 1 — the payee, with the rail on
-//! cargo run --release
-//! cargo run --example spilman-payer --features payer-driver -- --payee http://127.0.0.1:8080
+//! # terminal 1 — the payee, with the rail on (see docs/spilman-channel-rail.md)
+//! # terminal 2 — a mint that will actually pay its own quotes, e.g. the bench one
+//! # terminal 3 — the driver
+//! cargo run --example spilman-payer --features payer-driver -- \
+//!     --mint-url http://127.0.0.1:3499 --module-url http://127.0.0.1:8080
 //! ```
 //!
-//! Every step prints its outcome; the process exits non-zero on the first failure.
-//! That is the whole contract: a driver that printed a trace and exited 0 would
-//! make a red E2E look green.
+//! # The exit contract
+//!
+//! Every exit path — success, failure, usage error — prints `PAYER_EXIT=<n>`,
+//! because the lane reads the log over a serial console where the process's real
+//! status is invisible. It also prints two machine markers it greps for, whose
+//! shapes its regexes fix:
+//!
+//! ```text
+//! PAYER_OPEN_OK channel_id=<hex>
+//! PAYER_SETTLE_OK channel_id=<hex> balance=<n> payee_credited=<n>
+//! ```
+//!
+//! The human `[n/5] ...` lines are printed as well: a marker that replaced the
+//! human line would make the lane pass while making a failure harder to read.
 //!
 //! # What it deliberately does not do
 //!
@@ -41,16 +85,14 @@
 //! refused must not be followed by a "settled" line), so continuing past a failure
 //! would produce a log that reads like a run and isn't one.
 
-use cdk_spilman::{
-    build_cashu_b_token, parse_keyset_info_from_json, ConfigurableClientHost, SpilmanClientBridge,
-};
-use cdk_spilman_test_mint::{serve_existing_mint_with_shutdown, TestMintConfig, TestMintHelper};
+use cdk_spilman::{parse_keyset_info_from_json, ConfigurableClientHost, SpilmanClientBridge};
 use cashu::nuts::SecretKey;
+use tollgate_module_basic_rust::spilman::mint_http::{funding_token, RemoteMint, DEFAULT_QUOTE_TIMEOUT};
 use tollgate_module_basic_rust::spilman::payer::{
     self, ChannelOpening, DEFAULT_CHANNEL_LIFETIME_SECS,
 };
-use tollgate_module_basic_rust::spilman::registration::ChannelRegistrationRequest;
 use tollgate_module_basic_rust::spilman::payer_driver::PayeeClient;
+use tollgate_module_basic_rust::spilman::registration::ChannelRegistrationRequest;
 use tollgate_module_basic_rust::spilman::SpilmanError;
 
 /// Capacity, in sats, of the channel this driver opens.
@@ -62,9 +104,39 @@ const CHANNEL_CAPACITY: u64 = 64;
 /// How much of the channel the driver actually spends, in raw channel units.
 const PAYMENT_RAW_UNITS: u64 = 1;
 
-/// One request's timeout against the payee — see `PayableClient`'s own default.
-const EXAMPLE_PAYEE_URL: &str = "http://127.0.0.1:8080";
+/// The one flow this driver implements.
+///
+/// Named in the CLI rather than implied, because the lane passes it: a driver that
+/// silently accepted `--flow anything` would report success for a flow it never ran.
+const FLOW_OPEN_SETTLE: &str = "open-settle";
 
+const USAGE: &str = "usage: spilman-payer --mint-url <url> --module-url <base-url> [--flow open-settle]
+       spilman-payer --mint-file <path> --module-url <base-url> [--flow open-settle]
+
+  --mint-url <url>    the mint to fund the channel at (a remote mint over HTTP)
+  --mint-file <path>  read that mint URL from a file instead (whitespace trimmed)
+  --module-url <url>  the running module's base URL, e.g. http://127.0.0.1:8080
+  --payee <url>       alias for --module-url
+  --flow <name>       the flow to run; only 'open-settle' is implemented
+  --help, -h          this text";
+
+/// Everything the driver needs from its command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Args {
+    /// Where to fund. Either given directly or read from a file.
+    mint: MintSource,
+    /// The payee's base URL.
+    module_url: String,
+    /// The flow, validated against the one value this driver implements.
+    flow: String,
+}
+
+/// `--mint-url <url>` or `--mint-file <path>`; exactly one is required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MintSource {
+    Url(String),
+    File(std::path::PathBuf),
+}
 
 /// Print a step's outcome in a shape a log can be grepped for.
 fn step(n: u8, what: &str, outcome: &str) {
@@ -112,6 +184,107 @@ fn fail(what: &str, err: &SpilmanError) -> ! {
     exit_with(1);
 }
 
+/// A usage error: say what was wrong, show the usage, exit 2.
+///
+/// Exit 2 (not 1) so the lane can tell "this binary does not implement my CLI"
+/// from "this run failed", which is the difference between a build/deploy bug and
+/// a protocol bug.
+fn usage_error(why: &str) -> ! {
+    eprintln!("{why}");
+    eprintln!("{USAGE}");
+    exit_with(2);
+}
+
+/// Parse the command line, or exit 2 with the usage.
+fn parse_args() -> Args {
+    let mut args = std::env::args().skip(1);
+    let mut mint_url: Option<String> = None;
+    let mut mint_file: Option<String> = None;
+    let mut module_url: Option<String> = None;
+    let mut flow: Option<String> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--mint-url" => mint_url = args.next(),
+            "--mint-file" => mint_file = args.next(),
+            // `--payee` is the pre-lane spelling of the same value; it is an alias,
+            // not a separate concept, so it must not be able to disagree with
+            // `--module-url`. Whichever appears last wins, exactly as a repeated
+            // flag would.
+            "--payee" | "--module-url" => module_url = args.next(),
+            "--flow" => flow = args.next(),
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                exit_with(0);
+            }
+            other => usage_error(&format!("unexpected argument: {other}")),
+        }
+    }
+
+    let mint = match (mint_url, mint_file) {
+        (Some(url), None) => {
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                usage_error("--mint-url was given an empty value");
+            }
+            MintSource::Url(url)
+        }
+        (None, Some(path)) => {
+            let path = path.trim().to_string();
+            if path.is_empty() {
+                usage_error("--mint-file was given an empty path");
+            }
+            MintSource::File(std::path::PathBuf::from(path))
+        }
+        // Two sources of truth for where the money goes is a bug waiting to be
+        // silent: refuse rather than pick one.
+        (Some(_), Some(_)) => usage_error("give either --mint-url or --mint-file, not both"),
+        (None, None) => usage_error("no mint given: --mint-url or --mint-file is required"),
+    };
+
+    let module_url = match module_url {
+        Some(url) if !url.trim().is_empty() => url.trim().to_string(),
+        _ => usage_error("no module URL given: --module-url is required"),
+    };
+
+    let flow = flow.unwrap_or_else(|| FLOW_OPEN_SETTLE.to_string());
+    if flow != FLOW_OPEN_SETTLE {
+        usage_error(&format!(
+            "unsupported --flow {flow:?}; this driver implements only {FLOW_OPEN_SETTLE:?}"
+        ));
+    }
+
+    Args {
+        mint,
+        module_url,
+        flow,
+    }
+}
+
+/// Resolve [`MintSource`] to a URL, reading the file when that is what was asked.
+///
+/// An empty file is an error rather than a fallback: a driver that quietly funded
+/// at some default mint because a path was empty would be showing green for a
+/// configuration nobody wrote.
+fn resolve_mint(source: &MintSource) -> Result<String, String> {
+    match source {
+        MintSource::Url(url) => Ok(url.clone()),
+        MintSource::File(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("read --mint-file {}: {e}", path.display()))?;
+            let url = raw.trim().to_string();
+            if url.is_empty() {
+                return Err(format!(
+                    "--mint-file {} is empty: it must contain a mint URL, and funding at a \
+                     guessed mint would be a green run for a configuration nobody wrote",
+                    path.display()
+                ));
+            }
+            Ok(url)
+        }
+    }
+}
+
 /// A mint networking client for one leg of the protocol.
 ///
 /// `ReqwestClientNetworking` bridges the sync trait to async reqwest with
@@ -121,40 +294,20 @@ fn mint_networking() -> Result<cdk_spilman::ReqwestClientNetworking, SpilmanErro
         .map_err(|e| SpilmanError::Config(format!("build the mint networking client: {e}")))
 }
 
-/// Parse `--payee <url>`; anything else is a usage error.
-fn parse_args() -> String {
-    let mut args = std::env::args().skip(1);
-    let mut payee: Option<String> = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--payee" => payee = args.next(),
-            "--help" | "-h" => {
-                println!("usage: spilman-payer --payee <base-url>");
-                println!();
-                println!("  --payee <url>   the running module's base URL, e.g. {EXAMPLE_PAYEE_URL}");
-                exit_with(0);
-            }
-            other => {
-                eprintln!("unexpected argument: {other}");
-                eprintln!("usage: spilman-payer --payee <base-url>");
-                exit_with(2);
-            }
-        }
-    }
-    match payee {
-        Some(url) if !url.trim().is_empty() => url,
-        _ => {
-            eprintln!("usage: spilman-payer --payee <base-url>");
-            exit_with(2);
-        }
-    }
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     // `ReqwestClientNetworking` bridges sync->async with `block_in_place`, so a
     // multi-thread runtime is required; `multi_thread` above is not decoration.
-    let payee_url = parse_args();
+    let args = parse_args();
+    let mint_url = match resolve_mint(&args.mint) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("FAILED: {e}");
+            marker("PAYER_FAILED=resolve-mint-url");
+            exit_with(1);
+        }
+    };
+    let payee_url = args.module_url;
 
     let tempdir = match tempfile::tempdir() {
         Ok(dir) => dir,
@@ -190,46 +343,10 @@ async fn main() {
         ),
     );
 
-    // ── STEP 2: open and fund a real channel against a real mint ────────────
-    //
-    // The mint is in-process (a FakeWallet-backed real `cdk::Mint`), so the driver
-    // needs no external service. It is served over HTTP as well as handed to the
-    // payer's bridge, because the *payee* must be able to name the same mint: a
-    // channel funded at `https://test-mint` is only verifiable if the record the
-    // payee stores says `https://test-mint` too.
-    let helper = match TestMintHelper::new().await {
-        Ok(helper) => helper,
-        Err(e) => {
-            eprintln!("FAILED to start the in-process test mint: {e}");
-            exit_with(1);
-        }
-    };
-    let keyset_info_json = match helper.keyset_info_json() {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!("FAILED to read the test mint's keyset info: {e}");
-            exit_with(1);
-        }
-    };
-
-    // Bind an ephemeral port so two drivers can run at once.
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("FAILED to bind the test mint: {e}");
-            exit_with(1);
-        }
-    };
-    let mint_port = match listener.local_addr() {
-        Ok(addr) => addr.port(),
-        Err(e) => {
-            eprintln!("FAILED to read the test mint's address: {e}");
-            exit_with(1);
-        }
-    };
-    drop(listener); // the server below re-binds it; this was only to pick a port
-    let mint_url = format!("http://127.0.0.1:{mint_port}");
-
+    // The payee verifies a channel payment against the funding record *and* its
+    // own view of the mint. If those disagree, this run still proves the wire
+    // works, but not that the payee trusts this mint — say so, loudly, rather
+    // than letting a green run imply more than it measured.
     if advertised_mint != "<none>" && advertised_mint != mint_url {
         eprintln!(
             "WARNING: the payee advertises mint {advertised_mint}, but this driver funds at \
@@ -238,37 +355,48 @@ async fn main() {
         );
     }
 
-    // The mint has to actually listen, because the payer's funding swap goes over
-    // HTTP via `ReqwestClientNetworking` (not the in-memory shortcut) — this driver
-    // is meant to look like a real payer, so the mint leg is real too.
-    let mint_for_server = helper.mint();
-    let server_config = TestMintConfig::for_port(mint_port);
-    let server = tokio::spawn(async move {
-        serve_existing_mint_with_shutdown(mint_for_server, server_config, async {
-            // Runs until the driver exits; the process teardown ends it.
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-    });
+    // ── STEP 2: fund a real channel at a real, remote mint over HTTP ────────
+    //
+    // Everything below goes over the wire to `mint_url`. There is no in-process
+    // mint: the payee names the mint it will verify against, and the lane counts
+    // the calls this leg makes through a proxy in front of it.
+    //
+    // Step 2 prints twice — the mint leg, then the channel open — because they are
+    // the two halves of funding and a failure in either is worth seeing in the log.
+    let remote = match RemoteMint::new(&mint_url) {
+        Ok(mint) => mint,
+        Err(e) => fail("build the mint client", &e),
+    };
+    if let Err(e) = remote.info().await {
+        fail("GET /v1/info on the mint", &e);
+    }
 
-    // Give the listener a moment to come up, then prove it did rather than
-    // sleeping and hoping.
-    let mint_info_url = format!("{mint_url}/v1/info");
-    let mut ready = false;
-    for _ in 0..50 {
-        match reqwest::get(&mint_info_url).await {
-            Ok(resp) if resp.status().is_success() => {
-                ready = true;
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-        }
-    }
-    if !ready {
-        eprintln!("FAILED: the in-process test mint never answered {mint_info_url}");
-        server.abort();
-        exit_with(1);
-    }
+    let funded = match remote
+        .mint(CHANNEL_CAPACITY * 2, DEFAULT_QUOTE_TIMEOUT)
+        .await
+    {
+        Ok(funded) => funded,
+        Err(e) => fail("mint proofs at the remote mint", &e),
+    };
+    step(
+        2,
+        "mint proofs (NUT-04 over HTTP)",
+        &format!(
+            "mint={} amount={} keyset={} proofs={}",
+            remote.url(),
+            funded.amount,
+            funded.keyset_id,
+            funded.proofs.len()
+        ),
+    );
+
+    // The token must name the mint that signed the proofs; `funding_token` takes
+    // the URL for exactly that reason.
+    let token = match funding_token(remote.url(), &funded.proofs_json) {
+        Ok(token) => token,
+        Err(e) => fail("build the funding token", &e),
+    };
+    let keyset_info_json = funded.keyset_info_json.clone();
 
     let sender_secret = SecretKey::generate();
     let receiver_secret = SecretKey::generate();
@@ -280,7 +408,6 @@ async fn main() {
         Ok(host) => host,
         Err(e) => {
             eprintln!("FAILED to open the payer store: {e}");
-            server.abort();
             exit_with(1);
         }
     };
@@ -288,50 +415,17 @@ async fn main() {
 
     // Two mint clients, on purpose. `SpilmanClientBridge` consumes its networking by
     // value and exposes no accessor (see `spilman::payer`'s module docs), and a mint
-    // client is stateless configuration — so step 3 gets its own rather than the
-    // driver pretending one object can be shared.
+    // client is stateless configuration — so the funding swap gets its own rather
+    // than the driver pretending one object can be shared.
     let bridge_networking = match mint_networking() {
         Ok(networking) => networking,
-        Err(e) => {
-            server.abort();
-            eprintln!("FAILED to build the mint networking client: {e}");
-            exit_with(1);
-        }
+        Err(e) => fail("build the mint networking client", &e),
     };
     let swap_networking = match mint_networking() {
         Ok(networking) => networking,
-        Err(e) => {
-            server.abort();
-            eprintln!("FAILED to build the mint networking client: {e}");
-            exit_with(1);
-        }
+        Err(e) => fail("build the mint networking client", &e),
     };
     let client = SpilmanClientBridge::new(client_host, bridge_networking);
-
-    let proofs = match helper.mint_proofs(CHANNEL_CAPACITY * 2).await {
-        Ok(proofs) => proofs,
-        Err(e) => {
-            eprintln!("FAILED to mint test proofs: {e}");
-            server.abort();
-            exit_with(1);
-        }
-    };
-    let proofs_json = match serde_json::to_string(&proofs) {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!("FAILED to serialize test proofs: {e}");
-            server.abort();
-            exit_with(1);
-        }
-    };
-    let token = match build_cashu_b_token(&mint_url, "sat", &proofs_json) {
-        Ok(token) => token,
-        Err(e) => {
-            eprintln!("FAILED to build the funding token: {e}");
-            server.abort();
-            exit_with(1);
-        }
-    };
 
     let expiry = payer::now_seconds() + DEFAULT_CHANNEL_LIFETIME_SECS;
     let mut opening = match ChannelOpening::prepare(
@@ -344,10 +438,7 @@ async fn main() {
         64,
     ) {
         Ok(opening) => opening,
-        Err(e) => {
-            server.abort();
-            fail("prepare the channel open", &e)
-        }
+        Err(e) => fail("prepare the channel open", &e),
     };
     let channel_id = opening.channel_id().to_string();
     let capacity = opening.capacity();
@@ -355,19 +446,14 @@ async fn main() {
     // The two-phase open, in the only order that protects money: persist the
     // restore material, THEN swap.
     if let Err(e) = opening.save_opening(&client) {
-        server.abort();
         fail("persist the opening record", &e);
     }
     if let Err(e) = opening.submit_funding_swap(&swap_networking) {
-        server.abort();
         fail("submit the funding swap", &e);
     }
     let completed = match opening.finish_open(&client) {
         Ok(completed) => completed,
-        Err(e) => {
-            server.abort();
-            fail("complete the channel open", &e)
-        }
+        Err(e) => fail("complete the channel open", &e),
     };
 
     // The registration payload is built from upstream's own `Payment`, so the bytes
@@ -375,7 +461,6 @@ async fn main() {
     let registration_payment = match client.sign_channel_registration(&channel_id) {
         Ok(payment) => payment,
         Err(e) => {
-            server.abort();
             eprintln!("FAILED to sign the channel registration: {e}");
             exit_with(1);
         }
@@ -383,7 +468,6 @@ async fn main() {
     let keyset_id = match parse_keyset_info_from_json(&keyset_info_json) {
         Ok(info) => info.keyset_id,
         Err(e) => {
-            server.abort();
             eprintln!("FAILED to parse the keyset info this driver just fetched: {e}");
             exit_with(1);
         }
@@ -400,10 +484,7 @@ async fn main() {
             req.with_channel_secret(&sender_secret, &receiver_secret.public_key().to_hex())
         }) {
         Ok(req) => req.with_keyset_info_json(keyset_info_json.clone()),
-        Err(e) => {
-            server.abort();
-            fail("build the registration payload", &e)
-        }
+        Err(e) => fail("build the registration payload", &e),
     };
 
     // `finish_open` returns the mint's own view of the channel; the funding proofs
@@ -423,13 +504,19 @@ async fn main() {
             "FAILED: the mint completed a channel named {}, but the payer prepared {channel_id}",
             completed.channel_id
         );
-        server.abort();
-        marker(&format!("PAYER_FAILED=mint-channel-id-mismatch channel_id={channel_id}"));
+        marker(&format!(
+            "PAYER_FAILED=mint-channel-id-mismatch channel_id={channel_id}"
+        ));
         exit_with(1);
     }
 
     // The lane's E assertion: the channel is open and funded. Emitted only after the
     // id-mismatch check above, so a marker means "open AND agrees with the mint".
+    //
+    // Nothing between this line and `PAYER_SETTLE_OK` touches the mint: registration,
+    // signing and settlement are all local or payee-side. That is the claim the lane's
+    // counting proxy measures, and it is why this marker is emitted here rather than
+    // after the registration.
     marker(&format!(
         "PAYER_OPEN_OK channel_id={channel_id} capacity={capacity}"
     ));
@@ -437,10 +524,7 @@ async fn main() {
     // ── STEP 3: register it with the running payee ──────────────────────────
     let outcome = match payee.register_channel(&registration).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            server.abort();
-            fail("POST /spilman/channel", &e)
-        }
+        Err(e) => fail("POST /spilman/channel", &e),
     };
     step(
         3,
@@ -451,20 +535,14 @@ async fn main() {
     // ── STEP 4: sign and submit a payment ───────────────────────────────────
     let payment = match payer::step_payment(&client, &channel_id, PAYMENT_RAW_UNITS) {
         Ok(payment) => payment,
-        Err(e) => {
-            server.abort();
-            fail("sign a balance update", &e)
-        }
+        Err(e) => fail("sign a balance update", &e),
     };
     let paid = match payee
         .submit_payment(&channel_id, payment.balance, &payment.signature)
         .await
     {
         Ok(outcome) => outcome,
-        Err(e) => {
-            server.abort();
-            fail("POST /spilman/payment", &e)
-        }
+        Err(e) => fail("POST /spilman/payment", &e),
     };
     step(
         4,
@@ -479,10 +557,7 @@ async fn main() {
     // this is the payee saying what it *holds*.
     let status = match payee.status(&channel_id).await {
         Ok(status) => status,
-        Err(e) => {
-            server.abort();
-            fail("GET /spilman/status", &e)
-        }
+        Err(e) => fail("GET /spilman/status", &e),
     };
     let credited = status.get("balance").and_then(serde_json::Value::as_u64);
     step(
@@ -499,8 +574,6 @@ async fn main() {
                 .unwrap_or("<none>")
         ),
     );
-
-    server.abort();
 
     if credited != Some(PAYMENT_RAW_UNITS) {
         eprintln!(
@@ -524,9 +597,52 @@ async fn main() {
 
     println!();
     println!(
-        "OK: channel {channel_id} registered, paid {PAYMENT_RAW_UNITS} raw unit(s), and the \
-         payee holds exactly that balance."
+        "OK: channel {channel_id} opened at {}, registered, paid {PAYMENT_RAW_UNITS} raw unit(s), \
+         and the payee holds exactly that balance (flow={}).",
+        remote.url(),
+        args.flow
     );
-    drop(helper); // keep the mint (and its task) alive until after the last request
     exit_with(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_usage_names_every_flag_the_lane_passes() {
+        // The lane launches this binary with exactly these three flags plus --flow.
+        // If the usage text stops naming one, the next person to read a rejected run
+        // is reading a document that does not describe the interface.
+        for flag in ["--mint-url", "--mint-file", "--module-url", "--flow"] {
+            assert!(USAGE.contains(flag), "usage omits {flag}:\n{USAGE}");
+        }
+        assert!(USAGE.contains("--payee"), "usage omits the --payee alias");
+        assert!(USAGE.contains(FLOW_OPEN_SETTLE));
+    }
+
+    #[test]
+    fn an_empty_mint_file_is_an_error_not_a_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mint.txt");
+        std::fs::write(&path, "  \n\t\n").expect("write");
+        let err = resolve_mint(&MintSource::File(path)).expect_err("must refuse");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn a_mint_file_is_trimmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mint.txt");
+        std::fs::write(&path, "  http://127.0.0.1:3499\n").expect("write");
+        let url = resolve_mint(&MintSource::File(path)).expect("url");
+        assert_eq!(url, "http://127.0.0.1:3499");
+    }
+
+    #[test]
+    fn a_missing_mint_file_names_the_path_it_tried() {
+        let err = resolve_mint(&MintSource::File("/nonexistent/mint.txt".into()))
+            .expect_err("must refuse");
+        assert!(err.contains("/nonexistent/mint.txt"), "{err}");
+    }
 }

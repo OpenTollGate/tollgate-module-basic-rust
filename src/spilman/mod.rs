@@ -28,7 +28,13 @@
 
 pub mod billing;
 pub mod ledger;
+/// The **remote**-mint funding leg for the payer driver. Opt-in only: see the
+/// module docs and the `payer-driver` feature in `Cargo.toml`. A normal build
+/// must not contain a path that asks a mint for free money.
+#[cfg(feature = "payer-driver")]
+pub mod mint_http;
 pub mod payee_host;
+
 pub mod payer;
 pub mod payer_driver;
 pub mod payment_units;
@@ -140,6 +146,17 @@ pub enum SpilmanError {
 
     #[error("spilman config error: {0}")]
     Config(String),
+
+    /// A failure on the payer's mint leg (quote, keys, or the funding swap).
+    ///
+    /// Separate from [`SpilmanError::Config`] because the cause is the *mint*, not
+    /// this router's configuration: "the quote was never paid" and "the operator
+    /// left `channel_db_path` unset" want different fixes, and collapsing them
+    /// into one string is how a bench failure gets misdiagnosed as a config typo.
+    /// Only constructed by the `payer-driver` feature; the variant exists
+    /// unconditionally so the enum has one shape in every build.
+    #[error("spilman mint error: {0}")]
+    Mint(String),
 }
 
 /// What a rail decides about serving the next bytes of a session.
