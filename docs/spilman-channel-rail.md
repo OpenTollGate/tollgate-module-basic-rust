@@ -207,14 +207,37 @@ fallback except today's per-purchase token path.
 A channel's capacity is a prepayment to a **specific** upstream. If the router
 switches upstreams, the channel is stranded. Nothing here addresses that.
 
-### 3.5 Channel-id determinism is unresolved
+### 3.5 Channel-id determinism: EXPLAINED (was previously mis-attributed)
 
 Two runs of the same test with identical inputs produced **different** ids once and
-**equal** ids the next time. The blinding path uses `PreMintSecrets::random`
-(`cdk-spilman` `bindings.rs:233`), which predicts "always differs", yet one run
-reproduced the id exactly. An assertion claiming determinism was **removed** as
-unsound in both directions. The design does not depend on it — recovery keys on the
-**persisted** id — but the derivation should be traced before anyone builds on it.
+**equal** ids the next time. An assertion claiming determinism was **removed** as
+unsound in both directions. This section used to blame `PreMintSecrets::random`
+(`cdk-spilman` `bindings.rs:233`). **That attribution was wrong**, and a cold review
+caught it: `PreMintSecrets` appears **0 times** in `cdk-spilman/src/params.rs`.
+
+The id is derived by `get_channel_id_bytes` (`params.rs:562`), which hashes
+
+```
+mint|unit|capacity|funding_token_amount|keyset_id|input_fee_ppk|
+maximum_amount_for_one_output|setup_timestamp|sender_pubkey|receiver_pubkey|
+expiry_timestamp|channel_secret
+```
+
+`setup_timestamp` is an input, and it is a **wall-clock** value at open time. Two
+opens a second apart hash differently; two within the same second hash the same.
+That is exactly the observed behaviour — sometimes equal, sometimes not — and it is
+not randomness.
+
+**Why in-tree tests can never reproduce it:** `src/spilman/registration.rs:318`
+hardcodes `"setup_timestamp": 1_700_000_000`, so every fixture pins the input that
+varies. The field observation came from real opens, which use the real clock.
+
+**Does it block anything?** No. Recovery keys on the **persisted** id, never on a
+re-derived one, so nothing load-bearing depends on reproducibility. The unsound
+assertion stays removed: neither `assert_eq` nor `assert_ne` is correct, because
+the value is neither guaranteed equal nor guaranteed different. The honest fix, if
+anyone wants one, is to make `setup_timestamp` an explicit parameter rather than a
+clock read — a change in upstream `cdk-spilman`, not here.
 
 ---
 

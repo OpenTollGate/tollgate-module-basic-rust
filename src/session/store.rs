@@ -139,20 +139,67 @@ impl SessionStore {
 
     /// v1 -> v2: give existing sessions the channel-credit columns.
     ///
-    /// Idempotent in effect: the columns are added and existing rows are backfilled,
-    /// and re-running is prevented by the `user_version` stamp at the end (a second
-    /// call would fail on the duplicate column, which is why the stamp is written in
-    /// the same transaction).
+    /// # Why this is INTERRUPTION-SAFE rather than merely transactional
+    ///
+    /// The obvious version — `BEGIN; ALTER; ALTER; UPDATE; PRAGMA user_version = 2;
+    /// COMMIT;` — is atomic, so a crash mid-way rolls back cleanly and re-runs. But a
+    /// power cut between the SQLite COMMIT and the OS flushing the file is not the
+    /// only way to arrive at a half-migrated store: a router killed while the
+    /// transaction was committing, or a restored/copied database file, can present
+    /// columns WITHOUT the stamp. Measured (tests/session_store_migration.rs) as
+    /// `duplicate column name: retail_allotment`, which surfaced as a PERMANENT
+    /// STARTUP REFUSAL — the device would not boot.
+    ///
+    /// (Indented code blocks are DOCTESTS: `duplicate column name: ...` reads as a
+    /// Rust declaration and fails to compile. Prose with backticks, not an indented
+    /// block, is the correct way to quote SQLite's message here.)
+    /// A migration that can brick the router on an interrupted upgrade is not
+    /// acceptable, however correct its happy path.
+    ///
+    /// So the columns are added CONDITIONALLY, by asking the schema what it already
+    /// has. Re-running after a partial apply finishes the job instead of failing.
+    ///
+    /// The backfill stays `retail_allotment = allotment`, and it is only applied to
+    /// rows still at the column DEFAULT — a row that already carries a real retail
+    /// figure has been through this migration (or has since been extended) and must
+    /// not be overwritten with its current, possibly channel-inflated, allotment.
     fn migrate_v1_to_v2(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch(
-            "BEGIN;
-             ALTER TABLE sessions ADD COLUMN retail_allotment INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE sessions ADD COLUMN channel_id TEXT;
-             UPDATE sessions SET retail_allotment = allotment;
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )?;
+        let has_retail = self.column_exists("sessions", "retail_allotment")?;
+        let has_channel = self.column_exists("sessions", "channel_id")?;
+
+        let mut sql = String::from("BEGIN;");
+        if !has_retail {
+            sql.push_str(
+                " ALTER TABLE sessions ADD COLUMN retail_allotment INTEGER NOT NULL DEFAULT 0;",
+            );
+        }
+        if !has_channel {
+            sql.push_str(" ALTER TABLE sessions ADD COLUMN channel_id TEXT;");
+        }
+        // Only rows still at the default need the backfill. Doing it unconditionally
+        // would clobber a real retail figure on a re-run.
+        sql.push_str(
+            " UPDATE sessions SET retail_allotment = allotment
+                WHERE retail_allotment = 0 AND allotment <> 0;",
+        );
+        sql.push_str(&format!(" PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"));
+        self.conn.execute_batch(&sql)?;
         Ok(())
+    }
+
+    /// Does `table` already have `column`? Asked of SQLite, not assumed.
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn create_schema(&self) -> Result<(), StoreError> {

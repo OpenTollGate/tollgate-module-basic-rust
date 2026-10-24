@@ -33,10 +33,10 @@
 //! whether the blob is coherent. Keeping it out of `#[ignore]` is the entire point —
 //! a test the CI never runs is how the previous gap survived.
 
+use tollgate_module_basic_rust::config::schema::SpilmanConfig;
 use tollgate_module_basic_rust::spilman::ledger::{ChannelFundingRecord, ChannelLedger};
 use tollgate_module_basic_rust::spilman::rail::SpilmanRail;
 use tollgate_module_basic_rust::spilman::SpilmanError;
-use tollgate_module_basic_rust::config::schema::SpilmanConfig;
 
 fn rail_in(dir: &std::path::Path) -> SpilmanRail {
     let cfg = SpilmanConfig {
@@ -112,8 +112,10 @@ async fn a_known_channel_with_a_forged_signature_is_refused() {
              That is exactly the vacuity a previous version of \
              spilman_payment_authenticity.rs had."
         ),
-        other => panic!("refused for an unexpected reason: {other:?} -- the \
-                         refusal must be a FAILED VERIFICATION"),
+        other => panic!(
+            "refused for an unexpected reason: {other:?} -- the \
+                         refusal must be a FAILED VERIFICATION"
+        ),
     }
 
     // And nothing was written: a refusal that still records is worse than useless.

@@ -219,20 +219,55 @@ async fn a_later_payment_extends_the_same_session_without_losing_usage() {
     );
 }
 
-/// A balance whose unit cannot be converted must grant NOTHING.
+/// A channel that exists but has NO balance grants NO channel credit.
 ///
-/// The inverse of the repo's "absence is not zero" rule, and the deliberate one: a
-/// balance we cannot interpret is not a balance we can spend. Granting the retail half
-/// is correct; granting a guess of the channel half is not.
+/// This replaces an earlier test that claimed to cover the "unconvertible balance"
+/// case and did not: it used an UNKNOWN channel, so it exercised the
+/// unknown-channel guard and duplicated the test above it. A cold review caught
+/// that. A vacuous test is worse than a missing one because it looks like coverage.
+///
+/// The real case is a channel that is REGISTERED (so the unknown-channel guard does
+/// not apply) but has never been paid, so there is no balance row to convert. That
+/// must land on retail-only -- not on a panic, and not on a fabricated number.
+#[cfg(feature = "test-support")]
 #[test]
-fn an_unconvertible_balance_grants_no_channel_credit() {
+fn a_registered_but_unfunded_channel_grants_no_channel_credit() {
     let dir = tempfile::tempdir().expect("tempdir");
     let rail = rail_in(dir.path());
-    let s = session("aa:bb:cc:dd:ee:06", 4_242, Some("whatever"));
-    // The channel is unknown, so there is no balance to convert. The point of this
-    // test is that the failure path lands on retail-only rather than on a panic or a
-    // fabricated number.
-    assert_eq!(effective_allotment(&s, Some(&rail)), 4_242);
+
+    // Registered (so the unknown-channel guard does NOT apply) but never paid, so
+    // there is no balance row to convert. Both facts are asserted, because a test
+    // that accidentally exercises the unknown-channel guard proves nothing.
+    use tollgate_module_basic_rust::spilman::ledger::{ChannelFundingRecord, ChannelLedger};
+    let ledger = ChannelLedger::open(&dir.path().join("spilman.db")).expect("ledger");
+    ledger
+        .register_channel_funding(&ChannelFundingRecord {
+            channel_id: "chan-unfunded".to_string(),
+            params_json: "{}".to_string(),
+            funding_proofs_json: "[]".to_string(),
+            channel_secret_hex: "00".to_string(),
+            keyset_info_json: "{}".to_string(),
+            capacity: 1_000_000,
+            created_at: 0,
+        })
+        .expect("register a funding record without a balance");
+    assert!(
+        rail.is_known_channel("chan-unfunded").expect("read"),
+        "the channel must be KNOWN, or this test exercises the unknown-channel guard"
+    );
+    assert_eq!(
+        rail.channel_balance("chan-unfunded").expect("read"),
+        None,
+        "an unfunded channel must have NO balance row, which is what makes the \
+         conversion the thing under test"
+    );
+
+    let s = session("aa:bb:cc:dd:ee:06", 4_242, Some("chan-unfunded"));
+    assert_eq!(
+        effective_allotment(&s, Some(&rail)),
+        4_242,
+        "a known-but-unfunded channel must add zero credit and keep the retail half"
+    );
 }
 
 /// Convenience: wrap one session in a manager for the sweep tests.
