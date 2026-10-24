@@ -146,7 +146,7 @@ fn the_ledger_can_write_which_is_why_the_refusal_matters() {
     // why the RAIL must be the guard rather than the ledger. Documenting the
     // bypass here makes the rail's job explicit.
     ledger
-        .record_payment("chan-ctl", 5, "00")
+        .record_payment_unverified("chan-ctl", 5, "00")
         .expect("the ledger accepts whatever it is handed");
     assert_eq!(
         ledger.get_balance("chan-ctl").expect("read"),

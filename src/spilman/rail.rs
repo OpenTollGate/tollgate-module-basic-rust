@@ -214,7 +214,7 @@ impl SpilmanRail {
         balance: u64,
         signature: &str,
     ) -> Result<LedgerOutcome, SpilmanError> {
-        self.ledger.record_payment(channel_id, balance, signature)
+        self.ledger.record_payment_unverified(channel_id, balance, signature)
     }
 }
 
@@ -316,6 +316,6 @@ impl PaymentRail for SpilmanRail {
         //    because authenticity and "not a replay" are different questions: a
         //    re-sent valid signature verifies perfectly and must still not be credited
         //    twice.
-        self.ledger.record_payment(channel_id, balance, signature)
+        self.ledger.record_payment_unverified(channel_id, balance, signature)
     }
 }

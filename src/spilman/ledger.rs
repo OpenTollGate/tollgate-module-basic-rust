@@ -244,7 +244,28 @@ impl ChannelLedger {
     /// Rejects any balance that does not strictly advance the stored one. That
     /// covers replay (equal), stale/rollback (lower) and the same-balance
     /// different-signature double-credit case.
-    pub fn record_payment(
+    ///
+    /// # THIS DOES NOT AUTHENTICATE ANYTHING — hence the name
+    ///
+    /// It is a CAS primitive: it enforces "not a replay", not "genuinely signed".
+    /// A cold review found that as `pub fn record_payment` it was reachable from
+    /// anywhere in the crate, so an in-process caller could write an arbitrary
+    /// balance with an invented signature and the ledger would accept it — the
+    /// forgery fix was complete for the HTTP surface only.
+    ///
+    /// Two things now make that mistake hard to make:
+    ///
+    /// 1. the name says what it does: `record_payment_unverified`;
+    /// 2. it is `#[doc(hidden)]` and its only non-test caller is
+    ///    [`crate::spilman::rail::SpilmanRail::record_payment`], which validates
+    ///    the signature against the persisted funding record FIRST and calls this
+    ///    only after the check passes.
+    ///
+    /// `#[cfg(test)]`-style gating was considered and rejected: integration tests
+    /// in `tests/` live behind their own feature already, and hiding the CAS
+    /// arithmetic from them is how the credit maths would stop being tested.
+    #[doc(hidden)]
+    pub fn record_payment_unverified(
         &self,
         channel_id: &str,
         balance: u64,
@@ -516,13 +537,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("spilman.db");
         let ledger = ChannelLedger::open(&path).expect("open");
-        ledger.record_payment("c", 1, "s1").expect("prime");
+        ledger.record_payment_unverified("c", 1, "s1").expect("prime");
 
         // Two writers offer the same next balance. Exactly one may win; the CAS
         // guard (`WHERE balance = previous`) is what makes the second fail even
         // if both read the same previous value.
-        let a = ledger.record_payment("c", 2, "s2a");
-        let b = ledger.record_payment("c", 2, "s2b");
+        let a = ledger.record_payment_unverified("c", 2, "s2a");
+        let b = ledger.record_payment_unverified("c", 2, "s2b");
         assert_eq!(a, Ok(LedgerOutcome::Accepted));
         assert!(b.is_err());
         let stored = ledger
@@ -537,7 +558,7 @@ mod tests {
     #[test]
     fn zero_balance_cannot_be_recorded_twice() {
         let ledger = ChannelLedger::open_in_memory().expect("open");
-        assert!(ledger.record_payment("c", 0, "s0").is_err());
+        assert!(ledger.record_payment_unverified("c", 0, "s0").is_err());
         assert_eq!(ledger.get_balance("c").expect("query"), None);
     }
 

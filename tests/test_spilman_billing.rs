@@ -225,29 +225,29 @@ fn ledger_cas_accepts_exact_next_and_rejects_stale_or_replay() {
     let id = "chan-cas";
 
     assert_eq!(
-        ledger.record_payment(id, 10, "sig-10").expect("record 10"),
+        ledger.record_payment_unverified(id, 10, "sig-10").expect("record 10"),
         LedgerOutcome::Accepted
     );
     assert_eq!(ledger.get_balance(id).expect("balance"), Some(10));
 
     // Equal balance is a replay, not an advance.
-    assert!(ledger.record_payment(id, 10, "sig-10").is_err());
+    assert!(ledger.record_payment_unverified(id, 10, "sig-10").is_err());
     // Lower balance is stale.
-    assert!(ledger.record_payment(id, 5, "sig-5").is_err());
+    assert!(ledger.record_payment_unverified(id, 5, "sig-5").is_err());
     // Nothing above was written.
     assert_eq!(ledger.get_balance(id).expect("balance"), Some(10));
 
     // Exact next is accepted.
     assert_eq!(
-        ledger.record_payment(id, 11, "sig-11").expect("record 11"),
+        ledger.record_payment_unverified(id, 11, "sig-11").expect("record 11"),
         LedgerOutcome::Accepted
     );
     assert_eq!(ledger.get_balance(id).expect("balance"), Some(11));
     // Replaying the previous accepted payment now fails.
-    assert!(ledger.record_payment(id, 10, "sig-10").is_err());
+    assert!(ledger.record_payment_unverified(id, 10, "sig-10").is_err());
     // A jump forward is fine: the payer may pay several steps at once.
     assert_eq!(
-        ledger.record_payment(id, 20, "sig-20").expect("record 20"),
+        ledger.record_payment_unverified(id, 20, "sig-20").expect("record 20"),
         LedgerOutcome::Accepted
     );
     assert_eq!(ledger.get_balance(id).expect("balance"), Some(20));
@@ -261,11 +261,11 @@ fn ledger_cas_rejects_same_balance_with_a_different_signature() {
     let ledger = ChannelLedger::open(&dir.path().join("spilman.db")).expect("open ledger");
     let id = "chan-same-balance";
     assert_eq!(
-        ledger.record_payment(id, 7, "sig-a").expect("record"),
+        ledger.record_payment_unverified(id, 7, "sig-a").expect("record"),
         LedgerOutcome::Accepted
     );
     let err = ledger
-        .record_payment(id, 7, "sig-b")
+        .record_payment_unverified(id, 7, "sig-b")
         .expect_err("must reject");
     assert!(
         format!("{err}").contains("balance"),
@@ -286,7 +286,7 @@ fn ledger_balance_and_signature_survive_a_reopen() {
         let ledger = ChannelLedger::open(&path).expect("open ledger");
         assert_eq!(
             ledger
-                .record_payment("chan-durable", 42, "sig-42")
+                .record_payment_unverified("chan-durable", 42, "sig-42")
                 .expect("record"),
             LedgerOutcome::Accepted
         );
@@ -301,11 +301,11 @@ fn ledger_balance_and_signature_survive_a_reopen() {
     assert_eq!(stored.signature, "sig-42");
     // Replay after restart is still rejected — the CAS state is on disk.
     assert!(reopened
-        .record_payment("chan-durable", 42, "sig-42")
+        .record_payment_unverified("chan-durable", 42, "sig-42")
         .is_err());
     assert_eq!(
         reopened
-            .record_payment("chan-durable", 43, "sig-43")
+            .record_payment_unverified("chan-durable", 43, "sig-43")
             .expect("record"),
         LedgerOutcome::Accepted
     );
