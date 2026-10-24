@@ -18,6 +18,7 @@ pub mod quote;
 pub mod select;
 #[cfg(test)]
 mod select_test;
+pub mod spilman;
 pub mod usage;
 pub mod whoami;
 

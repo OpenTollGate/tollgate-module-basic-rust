@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 /// Fallback quote lifetime when the mint does not state one.
-
 /// The decision a GET poll makes, extracted so it is testable without a router.
 ///
 /// WHY THIS EXISTS: the ISSUED branch's comment claimed "fall through to the grant
@@ -258,6 +257,9 @@ pub async fn handle_create_ln_invoice(
 ///
 /// `resolve` is injected so a test can prove the header VALUES arrive, without needing a
 /// DHCP lease on the test machine.
+// Used by `ln_invoice_identity_test`; without that test module this is dead code in
+// the plain lib target, hence the scoped allow rather than a `pub` leak.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_device(
     forwarded: Option<&str>,
     real_ip: Option<&str>,

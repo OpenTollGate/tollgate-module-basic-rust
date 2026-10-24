@@ -374,3 +374,69 @@ fn partial_config_yields_default_step_size_not_zero() {
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// TASK A (S2 phase 4): the Spilman rail is OFF unless a config explicitly turns it
+/// on. Default OFF is what makes `enabled: false` byte-identical to today's
+/// behaviour, so this is the load-bearing default and it is asserted, not assumed.
+#[test]
+fn default_config_has_the_spilman_rail_disabled() {
+    let cfg = Config::default();
+    assert!(
+        !cfg.spilman.enabled,
+        "a default config must NOT enable the Spilman rail"
+    );
+    assert_eq!(
+        cfg.spilman.in_bytes_per_millisat, 22_021,
+        "the parity rate is 22_021: at 22_020 a sat channel rounds one 21 MiB step up \
+         to 2 sat, a 100% overcharge at step granularity"
+    );
+    assert!(cfg.spilman.mint_url.is_none());
+    assert!(cfg.spilman.channel_db_path.is_none());
+}
+
+/// A config that omits the `spilman` object entirely (every config in the field
+/// today) must still parse, with the rail disabled.
+#[test]
+fn config_without_a_spilman_object_parses_disabled() {
+    let minimal = r#"{"config_version": "v0.0.8", "step_size": 1024}"#;
+    let cfg: Config = serde_json::from_str(minimal).expect("minimal config should parse");
+    assert!(!cfg.spilman.enabled);
+}
+
+/// An explicit opt-in parses field-for-field.
+#[test]
+fn spilman_config_parses_when_enabled() {
+    let json = r#"{
+        "config_version": "v0.0.8",
+        "spilman": {
+            "enabled": true,
+            "mint_url": "https://mint.example",
+            "in_bytes_per_millisat": 22021,
+            "channel_db_path": "/etc/tollgate/spilman.db"
+        }
+    }"#;
+    let cfg: Config = serde_json::from_str(json).expect("enabled config should parse");
+    assert!(cfg.spilman.enabled);
+    assert_eq!(
+        cfg.spilman.mint_url.as_deref(),
+        Some("https://mint.example")
+    );
+    assert_eq!(cfg.spilman.in_bytes_per_millisat, 22_021);
+    assert_eq!(
+        cfg.spilman.channel_db_path.as_deref(),
+        Some("/etc/tollgate/spilman.db")
+    );
+}
+
+/// The production config (no `spilman` key) must serialise back out with the rail
+/// still off — a config round-trip must never be how a rail gets switched on.
+#[test]
+fn production_config_round_trips_with_spilman_disabled() {
+    let cfg: Config =
+        serde_json::from_str(PRODUCTION_CONFIG_JSON).expect("production config parses");
+    assert!(!cfg.spilman.enabled);
+    let json = serde_json::to_string(&cfg).expect("serialise");
+    let back: Config = serde_json::from_str(&json).expect("round-trip");
+    assert!(!back.spilman.enabled);
+    assert_eq!(back.spilman.in_bytes_per_millisat, 22_021);
+}

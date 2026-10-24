@@ -11,7 +11,7 @@
 
 use crate::http::AppState;
 use crate::identity_derive;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::json;
 

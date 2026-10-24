@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use tollgate_module_basic_rust::{cli, config, http, identity, session, tracing_setup, wallet};
+use tollgate_module_basic_rust::{
+    cli, config, http, identity, session, spilman, tracing_setup, wallet,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -108,6 +110,28 @@ async fn main() {
         p
     };
 
+    // Wholesale Spilman rail. `None` unless config.json says `spilman.enabled`.
+    //
+    // A config error here is fatal on purpose (EX_CONFIG): an operator who opted
+    // into the wholesale rail and got the config wrong must not silently fall back
+    // to "channel payments are refused" or, worse, to a ledger that forgets.
+    let spilman_rail = match spilman::SpilmanRail::from_config(&config_obj.spilman) {
+        Ok(rail) => rail.map(Arc::new),
+        Err(e) => {
+            eprintln!("FATAL: spilman config: {e}");
+            std::process::exit(78); // EX_CONFIG
+        }
+    };
+    if let Some(rail) = &spilman_rail {
+        tracing::info!(
+            in_bytes_per_millisat = rail.in_bytes_per_millisat(),
+            mint = rail.mint_url().unwrap_or("<none>"),
+            "spilman wholesale rail ENABLED"
+        );
+    } else {
+        tracing::debug!("spilman wholesale rail disabled");
+    }
+
     // Build app state
     let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
@@ -125,6 +149,7 @@ async fn main() {
         quotes: Arc::new(std::sync::Mutex::new(
             http::routes::quote::MintQuoteRegistry::new(),
         )),
+        spilman: spilman_rail,
     });
 
     // Start HTTP server + CLI socket
@@ -190,7 +215,9 @@ async fn main() {
     // the client kept the access it paid for. The sweep closes terminal sessions and
     // their gates every 30s (operator-accepted interval).
     let sweep_state = state.clone();
-    let sweep_handle = tokio::spawn(async move {
+    // Underscore-prefixed only to say "held, not read": the handle is kept alive so
+    // the sweep task is not detached-and-forgotten. Pre-existing site.
+    let _sweep_handle = tokio::spawn(async move {
         let mut tick =
             tokio::time::interval(std::time::Duration::from_secs(session::SWEEP_INTERVAL_SECS));
         // The first tick fires immediately; that is fine — it is a no-op when nothing
@@ -236,12 +263,24 @@ async fn main() {
 
             // STEP 3: write the live counters back, THEN decide terminal. Only now
             // can `used >= allotment` be true from real traffic.
+            //
+            // The decision goes through `sweep_with_channel_credit`: for a
+            // channel-bound session it first recomputes `allotment` from the
+            // channel's latest VERIFIED balance, so an increment that landed since
+            // the last tick extends access without a new gate-open, and an exhausted
+            // channel stops granting. With no rail the recomputation is the identity
+            // (`channel_id` is always None, effective == retail), which is what keeps
+            // the rail-off path bit-identical rather than merely similar.
             let terminal = {
                 let mut sessions = sweep_state.sessions.lock().await;
                 for (mac, used) in &live_readings {
                     sessions.update_usage(mac, *used);
                 }
-                let terminal = session::terminal_sessions(sessions.map_ref(), now);
+                let terminal = session::channel_credit::sweep_with_channel_credit(
+                    &mut sessions,
+                    sweep_state.spilman.as_deref(),
+                    now,
+                );
                 for mac in &terminal {
                     // Flush the exact final usage BEFORE removing the row: the
                     // terminal value is what a dispute would be settled against

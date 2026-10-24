@@ -24,6 +24,7 @@ fn state() -> AppState {
         quotes: Arc::new(std::sync::Mutex::new(
             crate::http::routes::quote::MintQuoteRegistry::new(),
         )),
+        spilman: None,
     }
 }
 
@@ -32,6 +33,13 @@ fn state() -> AppState {
 static LEASE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run an async block with a DHCP lease seeded for the mocked peer; restores after.
+///
+/// Pre-existing site: the `MutexGuard` returned by `ENV_LOCK` is held across the
+/// `.await` inside `f`. That is intentional here — the whole point is to serialise
+/// the awaited body against other tests mutating the same process-global env var, and
+/// replacing it with an async lock would be a real behaviour change (lease-file
+/// teardown could then interleave with another test's assertions).
+#[allow(clippy::await_holding_lock)]
 async fn with_lease<F, Fut>(f: F) -> (StatusCode, String)
 where
     F: FnOnce() -> Fut,

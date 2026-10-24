@@ -1,39 +1,150 @@
-# Path A progress — tollgate-module-basic-rust
 
-One line per item: `A<n> | finding | status | files touched`
-A1 | 1022 was unsigned hand-built JSON, allotment was `received*1000` (unrelated to the price table) | DONE | src/http/routes/pay.rs, src/http/routes/pay_session_test.rs, src/nostr_event.rs
-A2 | every failure path emitted bare {kind,content} JSON with no level/code/sig | DONE | src/http/routes/pay.rs, src/http/routes/pay_notice_test.rs, src/http/routes/mod.rs
-A4 | absent Content-Type answered 415; String extractor unbounded (no 1 MiB cap) | DONE | src/http/routes/pay.rs, src/http/routes/pay_body_test.rs, src/http/routes/mod.rs
-A3 | sessions keyed on the 00:00:00:00:00:00 sentinel; /usage keyed on an IP => never matched; metering dead | DONE | src/http/mac/{mod,tests}.rs, src/http/routes/{pay,usage,whoami}.rs, src/http/mod.rs
-A7 | metering module never called: `/usage` always reported 0 used | DONE (wired, not deleted) | src/metering/{mod,wiring_test}.rs, src/http/routes/usage.rs
-A5 | /ln-invoice was a stub: fake quote ids, hardcoded unpaid, expiry 0 | DONE (state machine; invoice fetch still needs a bound CDK wallet) | src/http/routes/{quote,ln_invoice,ln_invoice_quote_test}.rs, src/http/mod.rs, src/main.rs, src/cli/mod.rs, src/http/routes/discovery_test.rs, Cargo.toml
-A6 | accepted_mints.first() both priced payments and gated acceptance: 2nd-mint tokens mispriced | DONE (selection; wallet still single-instance) | src/http/routes/{select,select_test,pay}.rs, src/wallet/verify.rs, src/http/routes/mod.rs
-A9 | 3 tests in usage.rs compared literals to literals and never called the handler | DONE | src/http/routes/usage.rs
-A8 | no way to measure the binary against the corpus; runner found a 30s hang on unaccepted mints | DONE | ci/conformance_runner.py, conformance/verdicts.json, src/main.rs, src/http/routes/pay.rs
-P1 | sessions/quotes were in-memory: restart lost every paid session and every unpaid quote | DONE (SQLite WAL+FULL, fail-closed) | src/session/{store,store_test}.rs, src/session/mod.rs, src/main.rs, src/cli/mod.rs, Cargo.toml
-P2 | runner reported verify/spend UNVERIFIED even with a mint; no live lane existed | DONE (mint reachable + NUT-07 detected; per-fixture proof check needs V4 CBOR) | ci/mint_probe.py, ci/test_mint_probe.py, ci/conformance_runner.py, conformance/verdicts.json
-REMEASURE | corpus KG twins regenerated from a reachable mint (tollgate#47); verify/spend became measurable | PASS 13->15, UNVERIFIED 14->12 | conformance/verdicts.json, REPORT.md
-ADR-0002 | usage counter paid a fsync per metering tick (money rule applied to a cache) | DONE (5s OR 5% OR terminal flush) | src/session/{mod,store,usage_batching_test}.rs
-P3 | /ln-invoice invented quote ids and returned an empty request, so no client could pay | DONE (real BOLT11 from the mint) | src/http/routes/{ln_invoice,ln_invoice_live_test}.rs, src/wallet/wallet.rs
-P4 | two-mint behaviour was untested; the code already keyed wallets by mint | DONE (regression tests, no code change) | src/wallet/{per_mint_test,mod}.rs
-P5 | /ln-invoice shape did not match corpus; PAID quote never minted or granted | PARTIAL: shape fixed, grant hardware-gated | src/http/routes/{ln_invoice,ln_invoice_contract_test}.rs, src/wallet/wallet.rs
-P5a | aarch64 musl cross-build was recorded as blocked; it is not - musl.cc toolchain works | DONE (verified on hardware) | ci/cross-build-aarch64.sh
-P5b | /balance returned a wallet dump, not the corpus client-session shape; found on hardware | DONE (verified on device) | src/http/routes/{balance,balance_contract_test}.rs
-P5c | runner had no way to measure a DEPLOYED gateway; added --url mode and ran it against A04E | DONE (13 PASS on hardware) | ci/conformance_runner.py, conformance/verdicts-hardware-a04e.json
-P5d | /balance had the same three-None identity bug; second grant reset usage instead of extending | DONE (grant measured on hardware) | src/http/routes/{balance,balance_contract_test,purchase_path_test}.rs, src/session/mod.rs
-P5e | measured grant E2E + additive top-up + /balance session visibility on A04E | DONE (3 PASS measured) | conformance/hardware-grant-e2e-a04e.json
-P5f | metering called `ndsctl state`, which does not exist; usage was a permanent silent zero | command+parser fixed, HW round-trip UNVERIFIED | src/metering/mod.rs
-P5g | parser expected an INVENTED nested shape; real ndsctl output is flat | fixed against captured bytes, counters still UNVERIFIED | src/metering/mod.rs
-P5h | module never called ndsctl auth; /usage still on the dead `state` command; suite flaky 3/10 | DONE unit+HW-reachable, counters UNVERIFIED | src/metering/{mod,wiring_test,}.rs, src/http/routes/ln_invoice.rs, src/config/tests.rs
-P5i | metering round trip measured end to end: pay->gate->bytes counted->/usage live | DONE (MEASURED) | conformance/metering-round-trip-measured.json
-P5j | whole chain repeatable as one command | DONE — lane PASS on hardware | ci/hardware_roundtrip.py
-P6a | ADR-0006 close path: sweep+deauth+continuity; live-counter sync bug found on HW | DONE unit+mutation, loop UNVERIFIED pending re-grant fix | src/session/{mod,gate_close_test}.rs, src/metering/mod.rs, src/main.rs
-P6b | GET re-polls re-granted 1000->12000 (measured); pure poll_grant_decision + Issued mark as idempotency token | FIXED, unit+mutation green; HW re-measure next | src/http/routes/ln_invoice.rs
-P6c | ADR-0006 loop measured on HW: idempotency PASS (12 polls, flat 1000), sweep close PASS (-1/-1 within 30s), gate closed PASS (307 splash) | DONE — MEASURED | conformance/adr-0006-close-measured.json
-P6d | §5 boot continuity measured: SIGKILL -> restart -> gate restored, session intact (2000 allotment, live usage 8) | DONE — MEASURED | conformance/boot-continuity-measured.json
-P6e | hardware verdict set re-measured WITH live mint: PASS 13->17, verify/spend kg181 twins now real NUT-07 | DONE — MEASURED | conformance/verdicts-hardware-a04e.json
-P6f | security: XFF trust = LAN identity forgery (curl away); Go origin pins socket-scoped contract, Rust diverges all 3 points | ADR-0007 proposed, §3 open | docs/adr/0007-identity-is-the-socket.md
-P7a | identity from TCP peer per ADR-0007 §3(a); XFF trust closed | DONE unit+mutation; HW unverified | src/http/mac/mod.rs src/http/*.rs src/config/schema.rs
-P7b | ADR-0007 Accepted, §3=(a) implemented #54 | HW verification outstanding | docs/adr/0007-identity-is-the-socket.md
-P7c | ADR-0007 §2 wire headers (named identity + ignored claim) via middleware | DONE unit+mutation; HW unverified | src/http/mod.rs src/http/wire_identity_test.rs
-P7d | ADR-0007 forgery MEASURED BLOCKED on HW, incl. live paid session; §2 headers on the wire | DONE — MEASURED | conformance/adr-0007-identity-measured.json
+
+## Phase 3 — payer-side channel lifecycle + crash recovery (GREEN)
+
+**Finding (the seam is usage-context, not the payment balance).** The payee's
+`get_amount_due` is computed from its own **accumulated usage variables**, fed by the
+`context` JSON passed to `process_payment` — *not* from the balance the payer signed. The
+cooperative close then hard-checks `balance == host.get_amount_due(channel_id, None)` and
+rejects with `ValidationFailed { expected: 0, got: N }` when the two disagree. So the byte
+counter must be driven into the payee on every payment, and the payee's `pricing_scale`
+must be the byte price of one step. In this rail that is `pricing_scale = STEP`
+(22,020,096), i.e. one 21 MiB step costs exactly 1 sat. This is the concrete form of the
+"compute amount_due once from cumulative bytes" rule in §4, and it is now asserted in the
+integration test (`accepted.amount_due == balance`).
+
+**Second finding (a bug this phase caught).** The protocol's `sender_pubkey_hex` argument
+is a **public** key; passing the secret's raw scalar fails deep inside the bridge with
+`No key found for pubkey: ...`. The test now has separate `secret_hex()` / `pubkey_hex()`
+helpers so the two can never be confused again.
+
+**Third finding (no accessors).** cdk-spilman implements `SpilmanClientHost` on the
+concrete `ConfigurableClientHost<S>` only — no blanket `Arc<H>` impl — and
+`SpilmanClientBridge` owns its host with no accessor and consumes its networking by value.
+Rather than build a ~20-method forwarding wrapper for no benefit, the rail:
+- passes the `SpilmanClientNetworking` **into** `submit_funding_swap` (a mint client is
+  stateless config, so a second instance is equivalent), and
+- proves durability by opening a **separate read-only SQLite connection**
+  (`ConfigurableClientHost::open_sqlite_read_only`) to the same file. That is a stronger
+  proof than reading back through the writing handle, and it is why
+  `payer::open_read_only_host` exists.
+- `step_payment` deliberately takes **no** networking argument, so the hot path is
+  structurally incapable of a mint round trip.
+
+**Tests.** `tests/spilman_payer_lifecycle.rs`, all `#[ignore]`-gated (they need a mint),
+run with `cargo test --test spilman_payer_lifecycle -- --ignored` against the in-process
+`cdk-spilman-test-mint` harness. **3/3 pass**:
+1. `payer_opens_signs_and_settles_a_channel` — two-phase open, 10 signed updates at
+   exactly 1 sat/step, zero mint calls between open and settle, payee settles for exactly
+   the signed balance after a restart, and the quantised retail model bills the same line.
+2. `killed_process_between_persist_and_swap_recovers_the_channel` — crash before the
+   swap: state survives as `OpeningFromSwap`, the re-prepared instance refuses to swap,
+   and a failed restore never promotes the channel to `Open`.
+3. `killed_after_swap_but_before_mark_open_recovers_the_channel` — crash *after* the
+   swap, before `mark_open`: NUT-09 restore from the store alone recovers the funding
+   proofs, and the recovered channel is immediately payable with no second mint spend.
+
+Plus 3 unit tests in `payer.rs` pinning the fund-safety gate, clock sanity, and the
+expiry margin (§6 hazard 5).
+
+**Counts.** `cargo test --all-targets`: 216 lib + 14 billing, 0 failed. The 3 integration
+tests are `ignored` by default, so the default run is unchanged for CI.
+
+**Files touched.** `src/spilman/payer.rs` (new: `ChannelOpening` two-phase +
+`step_payment` + `recover_open_channel` + `open_read_only_host` + `ensure_persisted`),
+`src/spilman/mod.rs` (`pub mod payer`), `tests/spilman_payer_lifecycle.rs` (new),
+`Cargo.toml` (dev-dependency `cdk-spilman-test-mint`).
+
+## Phase 4 — payee-side payment verification (GREEN)
+
+**What was broken.** `record_payment` refused every payment, because the payee held no
+per-channel funding record to verify a signature against. Refusing is safe but it also
+means no real payment can ever be accepted, so the rail was unusable — and the host E2E
+(`~/reports/spilman-tollgate/host-e2e-spilman.sh`) could not justify a pass at assertion D.
+
+**The fix, in three parts.**
+
+1. **The funding record is durable** (`src/spilman/ledger.rs`). `spilman_channel_funding`
+   lives in the same SQLite file as `spilman_channel_balance` — one file, one durability
+   story, one `synchronous = FULL` + WAL setting. It stores exactly the five values
+   upstream's `verify_signature` runs on (`params_json`, `funding_proofs_json`,
+   `channel_secret_hex`, `keyset_info_json`, plus the `capacity` ceiling read out of the
+   params) and reads them back **verbatim** — no re-serialisation in either direction.
+   `save_channel_funding` is `INSERT OR IGNORE`: first write wins, because the params carry
+   both the capacity ceiling and the secret the signature is checked against, so letting a
+   second registration replace them would let anyone raise the ceiling on an open channel.
+2. **A real payee host** (`src/spilman/payee_host.rs`). `LedgerPayeeHost` implements
+   cdk-spilman's `SpilmanHost` directly over the ledger, mirroring MONAD's shape
+   (`monad-relay/src/payments.rs:961`) rather than building the ~20-method
+   `SpilmanStorage` backend `configurable_host` wants — one host, one store, no second
+   copy of the balances. `validate_payment` only reads three host values, and all three
+   are genuine ledger reads that fail closed: `get_channel_state` → `Open` **iff a funding
+   record exists** (not iff a *balance* row exists — that is the state a forgery creates),
+   `get_funding` → the five values, `get_amount_due` → the stored balance. Every other hook
+   is a channel funding/close concern this rail does not implement, so it is an explicit
+   refusal or an empty answer, each labelled `NOT ON THE VERIFICATION PATH` with the
+   reason. `record_payment` is deliberately **inert**: credit is granted only by the CAS
+   ledger write, and a second monotonic balance writer is the exact shape of the
+   original bug.
+3. **Verify, then write** (`src/spilman/rail.rs`). `record_payment` now: loads the funding
+   record (absent → `UnknownChannel`, unchanged) → calls **upstream's own**
+   `SpilmanBridge::validate_payment` and refuses on any error → and only then writes the
+   CAS row. Not a re-implementation: the channel is re-derived by upstream from the
+   persisted bytes, so this rail cannot drift from the protocol's own definition of a
+   valid signature. Refusals carry upstream's reason in
+   `SpilmanError::PaymentNotVerified { detail }`, so a 409 explains itself.
+
+**Tests.** `tests/spilman_payee_verification.rs`, `#[ignore]`-gated (they need the mint,
+matching the phase-3 convention) — run with
+`cargo test --test spilman_payee_verification -- --ignored`. **7/7 pass.** The funding
+record is not hand-built in the tests: a reference `ConfigurableHost` — cdk-spilman's own
+payee host — processes the registration, and the five values are copied out with
+`get_funding_data`, so the bytes under test are the bytes upstream derived.
+1. `a_real_signed_payment_is_accepted` — **the load-bearing one.** A real Schnorr
+   signature over a real funded channel is accepted, becomes durable, and the resulting
+   credit serves exactly 22,021,000 bytes and denies 22,021,001. Without it, "refuse
+   everything" would pass every other test — exactly the state the hotfix left.
+2. `a_garbage_signature_on_a_funded_channel_is_refused` — the exact `"00"` forgery, now
+   on a channel that *is* funded; i.e. the case that was accepted before the hotfix.
+3. `a_correctly_shaped_but_wrong_signature_is_refused` — 128 hex chars of nonsense, **and**
+   a genuine signature for balance 1 presented as balance 2 (everything valid except the
+   signed message).
+4. `a_balance_above_capacity_is_refused` — capacity + 1, refused before the signature
+   check, with the detail naming the capacity.
+5. `a_replay_of_the_exact_previous_balance_is_refused` — the case authenticity *cannot*
+   catch: the signature verifies perfectly because it is valid, and the CAS is what
+   refuses. A pre-existing guarantee, now asserted on verified payments too.
+6. `a_refused_payment_leaves_no_balance_row` — and the baseline stays "nothing recorded",
+   proven by a genuine payment still being accepted afterwards.
+7. `an_unfunded_channel_still_reports_unknown` — the pre-existing contract is unchanged.
+
+**Mutation check (the tests have teeth).** Deleting only the `validate_payment` block
+from `record_payment` makes **4 of 7 fail** (`garbage`, `shaped-but-wrong`,
+`above-capacity`, `leaves-no-row`) while `a_real_signed_payment_is_accepted` still
+passes — which is exactly why the positive case and the refusals are both required.
+
+**`tests/spilman_payment_authenticity.rs` is untouched and still 3/3 green.**
+
+**Counts.** Default suite: 226 lib + 3 + 2 + 14 = **245 pass, 0 fail**, 13 ignored
+(7 new + 3 pre-existing + 3 more). `--features test-support`: all 7 result groups ok
+(incl. `rail_credits_exactly_what_was_recorded`). `-- --ignored`: 7 new + 3 pre-existing
+mint suites, 0 fail.
+
+**Files touched.** `src/spilman/ledger.rs` (`ChannelFundingRecord`,
+`save_channel_funding`, `get_channel_funding`, schema), `src/spilman/payee_host.rs` (new),
+`src/spilman/rail.rs` (verify-then-write), `src/spilman/mod.rs`
+(`SpilmanError::PaymentNotVerified`, exports), `tests/spilman_payee_verification.rs` (new).
+
+**Known, pre-existing, not fixed here.**
+- `cargo clippy --all-targets -- -D warnings` fails on two `field_reassign_with_default`
+  lints in `src/http/spilman_mount_test.rs`. Verified identical at `a7eca5d` with these
+  changes stashed, so it is not a regression from this work.
+- `cargo fmt` also wants to reflow `src/http/**`. Reverted rather than swept into these
+  commits.
+
+**Remaining for the physical-router E2E.** The rail verifies against a funding record that
+must be *written*. Nothing on the live router writes one yet: a payer's registration must
+reach the payee over HTTP and be turned into a `ChannelFundingRecord`. Next step is that
+registration route — accept params + funding proofs, validate them against the channel id
+(`validate_new_channel_funding`), persist via `save_channel_funding` — in front of the now
+working `record_payment`.

@@ -16,7 +16,7 @@
 
 use super::store::SessionStore;
 use super::SessionManager;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -40,7 +40,7 @@ fn now() -> u64 {
 }
 
 /// Read the persisted value straight from the store, bypassing the in-memory cache.
-fn persisted(path: &PathBuf, mac: &str) -> Option<u64> {
+fn persisted(path: &Path, mac: &str) -> Option<u64> {
     let st = SessionStore::open(path).ok()?;
     st.load_sessions()
         .ok()?
@@ -137,7 +137,9 @@ fn revoke_flushes_final_value() {
 fn expire_flushes_final_value() {
     let dir = tmpdir("expire");
     let path = dir.join("state.db");
-    let mut mgr = SessionManager::open(&path).unwrap();
+    // Pre-existing site: `mgr` is deliberately opened-but-unused, to prove that
+    // `open` itself (not a later call) performs the recovery close asserted below.
+    let _mgr = SessionManager::open(&path).unwrap();
     // Already-expired session, seeded directly.
     {
         let st = SessionStore::open(&path).unwrap();
@@ -148,6 +150,8 @@ fn expire_flushes_final_value() {
             metric: "bytes".into(),
             expiry: now() - 1,
             granted_at: now() - 100,
+            retail_allotment: now() - 100,
+            channel_id: None,
         })
         .unwrap();
     }

@@ -30,7 +30,7 @@ pub async fn handle_session_state(
         Some(m) => {
             let sessions = state.sessions.lock().await;
             match sessions.get_session(m) {
-                Some(s) if sessions.is_active(m) => (m.to_string(), "active"),
+                Some(_s) if sessions.is_active(m) => (m.to_string(), "active"),
                 // exists but expired/exhausted => expired; never existed => none
                 Some(_) => (m.to_string(), "expired"),
                 None => (m.to_string(), "none"),

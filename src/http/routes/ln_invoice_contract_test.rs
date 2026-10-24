@@ -26,6 +26,7 @@ fn test_mint() -> Option<String> {
     std::env::var("TOLLGATE_TEST_MINT").ok()
 }
 
+#[allow(clippy::field_reassign_with_default)]
 async fn state_with_mint(mint: &str) -> AppState {
     let mut cfg = crate::config::Config::default();
     cfg.accepted_mints = vec![crate::config::schema::MintConfig::default_production(
@@ -48,6 +49,7 @@ async fn state_with_mint(mint: &str) -> AppState {
             crate::session::SessionManager::new(),
         )),
         quotes: Arc::new(Mutex::new(MintQuoteRegistry::new())),
+        spilman: None,
     }
 }
 

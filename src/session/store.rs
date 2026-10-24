@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::CustomerSession;
 
 /// Current on-disk schema. Bump when the layout changes, and add a migration.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -121,11 +121,85 @@ impl SessionStore {
         if version == 0 {
             // Fresh database: create the schema and stamp it.
             store.create_schema()?;
+        } else if version == 1 {
+            // v1 -> v2: sessions gained the channel-credit columns.
+            //
+            // `retail_allotment = allotment` is the only honest backfill: at the
+            // moment of upgrade every session's ceiling WAS its retail purchase, and
+            // no session can have had a channel. Defaulting to 0 instead would revoke
+            // access from every live customer on upgrade, which is exactly the kind of
+            // "migration that loses value" the repo's own rules forbid.
+            store.migrate_v1_to_v2()?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::UnknownSchema { found: version });
         }
 
         Ok(store)
+    }
+
+    /// v1 -> v2: give existing sessions the channel-credit columns.
+    ///
+    /// # Why this is INTERRUPTION-SAFE rather than merely transactional
+    ///
+    /// The obvious version — `BEGIN; ALTER; ALTER; UPDATE; PRAGMA user_version = 2;
+    /// COMMIT;` — is atomic, so a crash mid-way rolls back cleanly and re-runs. But a
+    /// power cut between the SQLite COMMIT and the OS flushing the file is not the
+    /// only way to arrive at a half-migrated store: a router killed while the
+    /// transaction was committing, or a restored/copied database file, can present
+    /// columns WITHOUT the stamp. Measured (tests/session_store_migration.rs) as
+    /// `duplicate column name: retail_allotment`, which surfaced as a PERMANENT
+    /// STARTUP REFUSAL — the device would not boot.
+    ///
+    /// (Indented code blocks are DOCTESTS: `duplicate column name: ...` reads as a
+    /// Rust declaration and fails to compile. Prose with backticks, not an indented
+    /// block, is the correct way to quote SQLite's message here.)
+    /// A migration that can brick the router on an interrupted upgrade is not
+    /// acceptable, however correct its happy path.
+    ///
+    /// So the columns are added CONDITIONALLY, by asking the schema what it already
+    /// has. Re-running after a partial apply finishes the job instead of failing.
+    ///
+    /// The backfill stays `retail_allotment = allotment`, and it is only applied to
+    /// rows still at the column DEFAULT — a row that already carries a real retail
+    /// figure has been through this migration (or has since been extended) and must
+    /// not be overwritten with its current, possibly channel-inflated, allotment.
+    fn migrate_v1_to_v2(&self) -> Result<(), StoreError> {
+        let has_retail = self.column_exists("sessions", "retail_allotment")?;
+        let has_channel = self.column_exists("sessions", "channel_id")?;
+
+        let mut sql = String::from("BEGIN;");
+        if !has_retail {
+            sql.push_str(
+                " ALTER TABLE sessions ADD COLUMN retail_allotment INTEGER NOT NULL DEFAULT 0;",
+            );
+        }
+        if !has_channel {
+            sql.push_str(" ALTER TABLE sessions ADD COLUMN channel_id TEXT;");
+        }
+        // Only rows still at the default need the backfill. Doing it unconditionally
+        // would clobber a real retail figure on a re-run.
+        sql.push_str(
+            " UPDATE sessions SET retail_allotment = allotment
+                WHERE retail_allotment = 0 AND allotment <> 0;",
+        );
+        sql.push_str(&format!(" PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"));
+        self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    /// Does `table` already have `column`? Asked of SQLite, not assumed.
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn create_schema(&self) -> Result<(), StoreError> {
@@ -137,7 +211,14 @@ impl SessionStore {
                  used       INTEGER NOT NULL,
                  metric     TEXT    NOT NULL,
                  expiry     INTEGER NOT NULL,
-                 granted_at INTEGER NOT NULL
+                 granted_at INTEGER NOT NULL,
+                 -- Effective ceiling vs token-purchased credit. Two columns because
+                 -- the access path recomputes `allotment` from `retail_allotment`
+                 -- plus whatever a bound channel has verifiably paid for; collapsing
+                 -- them would lose the number the customer actually bought.
+                 -- `channel_id` NULL is the retail path and the common case.
+                 retail_allotment INTEGER NOT NULL DEFAULT 0,
+                 channel_id       TEXT
              );
              CREATE TABLE IF NOT EXISTS closed_usage (
                  mac        TEXT PRIMARY KEY,
@@ -167,14 +248,17 @@ impl SessionStore {
     /// Insert or replace a session row.
     pub fn upsert_session(&self, s: &CustomerSession) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO sessions (mac, allotment, used, metric, expiry, granted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO sessions
+                 (mac, allotment, used, metric, expiry, granted_at, retail_allotment, channel_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(mac) DO UPDATE SET
-                 allotment = excluded.allotment,
-                 used      = excluded.used,
-                 metric    = excluded.metric,
-                 expiry    = excluded.expiry,
-                 granted_at= excluded.granted_at",
+                 allotment       = excluded.allotment,
+                 used            = excluded.used,
+                 metric          = excluded.metric,
+                 expiry          = excluded.expiry,
+                 granted_at      = excluded.granted_at,
+                 retail_allotment= excluded.retail_allotment,
+                 channel_id      = excluded.channel_id",
             params![
                 s.mac,
                 s.allotment as i64,
@@ -182,6 +266,8 @@ impl SessionStore {
                 s.metric,
                 s.expiry as i64,
                 s.granted_at as i64,
+                s.retail_allotment as i64,
+                s.channel_id,
             ],
         )?;
         Ok(())
@@ -204,9 +290,10 @@ impl SessionStore {
 
     /// Load every session. Recovery decisions are the caller's job.
     pub fn load_sessions(&self) -> Result<Vec<CustomerSession>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT mac, allotment, used, metric, expiry, granted_at FROM sessions")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT mac, allotment, used, metric, expiry, granted_at, \
+                 retail_allotment, channel_id FROM sessions",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(CustomerSession {
                 mac: r.get(0)?,
@@ -215,6 +302,8 @@ impl SessionStore {
                 metric: r.get(3)?,
                 expiry: r.get::<_, i64>(4)? as u64,
                 granted_at: r.get::<_, i64>(5)? as u64,
+                retail_allotment: r.get::<_, i64>(6)? as u64,
+                channel_id: r.get(7)?,
             })
         })?;
         let mut out = Vec::new();

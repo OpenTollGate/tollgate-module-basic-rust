@@ -16,9 +16,42 @@ path = "src/lib.rs"
 name = "tollgate-module-basic-rust"
 path = "src/main.rs"
 
+# A TEST DRIVER, not a product feature: it opens a channel against an in-process
+# test mint, registers it with a *running* payee over HTTP, pays it, and reads the
+# result back. An *example* rather than a `[[bin]]`, because an example may use
+# dev-dependencies — which is exactly where the in-process test mint lives. That
+# keeps the test mint out of every shipped artifact, and `required-features` keeps
+# the driver itself out of a plain `cargo build`/`cargo test`.
+[[example]]
+name = "spilman-payer"
+path = "examples/spilman_payer.rs"
+required-features = ["payer-driver"]
+
+# The on-device proof that a channel's credit grants ACCESS. It records balances
+# through the `test-support` seam (the only way an integration-test-style binary
+# can seed credit without a real signature), so it is gated on that feature and
+# never built by a plain `cargo build`/`cargo test`.
+[[example]]
+name = "access_credit_probe"
+path = "examples/access_credit_probe.rs"
+required-features = ["test-support"]
+
+[features]
+# NOT in the default set, so a shipped binary does not contain the test seam.
+# Enables `SpilmanRail::record_payment_for_tests`, which bypasses signature
+# verification so the credit ARITHMETIC stays testable while the production
+# `record_payment` refuses unverified payments (CRITICAL-UNVERIFIED-PAYMENT.md).
+# Integration tests in tests/ are a separate crate, so they cannot use
+# #[cfg(test)] items of the library — hence a feature rather than cfg(test).
+test-support = []
+
+# Opts the `spilman-payer` example into the build. Off by default: a test driver
+# is not something a router image should carry, and it needs no dependency of its
+# own (the test mint is already a dev-dependency, visible to examples).
+payer-driver = []
+
 [dependencies]
-# P1: durable sessions/quotes. Already in the lock via cdk-sqlite, so this
-# adds no new code to build — it only makes the existing crate addressable.
+# P1: durable sessions/quotes. No new build cost — cdk-sqlite already pulls this in.
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time", "io-util", "fs", "process"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -28,12 +61,23 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
 http-body-util = "0.1"
 
-# Cashu Development Kit (wallet side — we are a wallet talking to mints)
-cdk = { version = "0.18", default-features = false, features = ["wallet"] }
-cdk-sqlite = "0.18"
+# Cashu Development Kit (wallet side — we are a wallet talking to mints).
+#
+# Sourced from git tag v0.18.1, NOT crates.io 0.18.2. `cdk-spilman` depends on
+# `cashu` from this exact git tag, and cargo treats a git source and a registry
+# source as distinct crates — mixing them yields two nominal `Proof` types that
+# cannot be passed to each other. crates.io `cdk-common 0.18.2` pins
+# `cashu = "=0.18.2"` exactly, so `[patch.crates-io]` cannot reconcile it either.
+# Moving the whole stack to the one git source is the only fix that unifies them.
+cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cdk", default-features = false, features = ["wallet"] }
+cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cdk-sqlite", default-features = false, features = ["wallet"] }
 
 # Cashu protocol primitives (Token parsing, NUT types)
-cashu = "0.18"
+cashu = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", package = "cashu", default-features = false }
+
+# Spilman payment channels (payment rail). Pinned to the same rev MONAD uses.
+# `client-sqlite` gives `SqliteClientStorage`, the durable payer-side store.
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", package = "cdk-spilman", features = ["wallet", "configurable-host-reqwest", "client-sqlite"] }
 
 # Serde / JSON
 serde = { version = "1", features = ["derive"] }
@@ -56,12 +100,18 @@ sha2 = "0.10"
 
 # Error derive macro
 thiserror = "1"
+# Async trait methods for the PaymentRail seam.
+async-trait = "0.1"
 hmac = "0.12"
 base64 = "0.23.1"
 bech32 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
+# Used by the #[ignore]-gated integration tests and by the `examples/spilman_payer.rs`
+# driver. A dev-dependency precisely so it cannot reach a shipped artifact. Same
+# pinned git rev as the main dependency, so it resolves to one crate.
+cdk-spilman-test-mint = { git = "https://github.com/SatsAndSports/cashu_spilman_channels.git", rev = "c2083defc2015ad0bae2a8a086a2876bc775ff79", package = "cdk-spilman-test-mint" }
 
 [profile.release]
 # Aggressive size optimization — tollgate ships on resource-constrained OpenWrt routers

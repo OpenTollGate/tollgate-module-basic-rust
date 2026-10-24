@@ -306,6 +306,7 @@ mod tests {
             quotes: Arc::new(std::sync::Mutex::new(
                 crate::http::routes::quote::MintQuoteRegistry::new(),
             )),
+            spilman: None,
         })
     }
 

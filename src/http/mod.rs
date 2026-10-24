@@ -17,6 +17,12 @@ pub struct AppState {
     pub sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
     /// A5: mint quotes created by `/ln-invoice`.
     pub quotes: Arc<std::sync::Mutex<crate::http::routes::quote::MintQuoteRegistry>>,
+    /// The wholesale Spilman rail, or `None` when `spilman.enabled` is false.
+    ///
+    /// `None` is the whole "zero behavioural change" mechanism: with the rail off
+    /// there is no object to consult, no `/spilman` router to mount, and the
+    /// retail path (`wallet`, `handle_pay`) is not touched at all.
+    pub spilman: Option<Arc<crate::spilman::SpilmanRail>>,
 }
 
 /// Build the main HTTP router with all routes.
@@ -53,7 +59,7 @@ pub fn create_router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    let router = Router::new()
         .route(
             "/",
             axum::routing::get(routes::discovery::handle_discovery).post(routes::pay::handle_pay),
@@ -88,13 +94,26 @@ pub fn create_router(state: AppState) -> Router {
             "/ln-invoice",
             axum::routing::post(routes::ln_invoice::handle_create_ln_invoice)
                 .get(routes::ln_invoice::handle_get_ln_invoice),
-        )
+        );
+
+    // The `/spilman` channel surface exists ONLY when the rail does. This is the
+    // observable half of "enabled: false changes nothing": with the rail off no
+    // route is mounted at all, so every `/spilman/*` path answers 404 without any
+    // handler ever running. Pinned by src/http/spilman_mount_test.rs.
+    let router = if state.spilman.is_some() {
+        router.nest("/spilman", routes::spilman::spilman_router())
+    } else {
+        router
+    };
+
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             stamp_identity,
         ))
-        .layer(cors)
-        .with_state(state)
+        .layer(cors);
+
+    router.with_state(state)
 }
 
 /// Test-only router with a mocked ConnectInfo, so handler tests can drive the
@@ -108,7 +127,6 @@ pub fn create_test_router_at(state: AppState, addr: std::net::SocketAddr) -> Rou
 #[cfg(test)]
 pub fn create_test_router(state: AppState) -> Router {
     use axum::extract::connect_info::MockConnectInfo;
-    use axum::extract::{ConnectInfo, State};
     create_router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
         [192, 168, 1, 50],
         44444,
@@ -120,6 +138,9 @@ mod identity_test;
 
 #[cfg(test)]
 mod parity_routes_test;
+
+#[cfg(test)]
+mod spilman_mount_test;
 
 #[cfg(test)]
 mod wire_identity_test;

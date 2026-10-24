@@ -33,6 +33,10 @@ fn missing_fields_are_zero_not_an_error() {
 /// `NotFound("Text file busy (os error 26)")` in ~3 of 10 runs.
 ///
 /// Closing explicitly and yielding once before returning keeps exec safe.
+// Pre-existing site: this helper predates the metering wiring tests that use it and
+// is currently unreferenced. Kept rather than deleted so the ETXTBSY note above stays
+// attached to the code it explains.
+#[allow(dead_code)]
 fn fake_ndsctl(dir: &tempfile::TempDir, script: &str) -> std::path::PathBuf {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
