@@ -10,7 +10,12 @@
 
 use tollgate_module_basic_rust::config::schema::{Config, SpilmanConfig};
 use tollgate_module_basic_rust::spilman::rail::SpilmanRail;
-use tollgate_module_basic_rust::spilman::{PaymentRail, RailDecision};
+use tollgate_module_basic_rust::spilman::PaymentRail;
+// Only the `test-support`-gated test below matches on decisions; importing it
+// unconditionally is an unused import in a DEFAULT build, and this repo's
+// `-D warnings` makes that a hard error.
+#[cfg(feature = "test-support")]
+use tollgate_module_basic_rust::spilman::RailDecision;
 
 fn enabled_config(db_path: &str) -> SpilmanConfig {
     SpilmanConfig {

@@ -20,19 +20,26 @@ use tower::ServiceExt;
 
 /// A state whose config has Spilman disabled, and therefore `spilman: None`.
 fn state_disabled() -> AppState {
-    let mut cfg = Config::default();
-    cfg.spilman = SpilmanConfig::default();
+    // Struct-update syntax rather than assign-after-default: clippy's
+    // field_reassign_with_default is denied in this repo's lint set, and the
+    // one-expression form is also harder to misread.
+    let cfg = Config {
+        spilman: SpilmanConfig::default(),
+        ..Config::default()
+    };
     build_state(cfg, None)
 }
 
 /// A state with the rail enabled and a real ledger on disk.
 fn state_enabled(dir: &std::path::Path) -> AppState {
-    let mut cfg = Config::default();
-    cfg.spilman = SpilmanConfig {
-        enabled: true,
-        mint_url: Some("https://mint.example".to_string()),
-        in_bytes_per_millisat: 22_021,
-        channel_db_path: Some(dir.join("spilman.db").to_string_lossy().to_string()),
+    let cfg = Config {
+        spilman: SpilmanConfig {
+            enabled: true,
+            mint_url: Some("https://mint.example".to_string()),
+            in_bytes_per_millisat: 22_021,
+            channel_db_path: Some(dir.join("spilman.db").to_string_lossy().to_string()),
+        },
+        ..Config::default()
     };
     let rail = SpilmanRail::from_config(&cfg.spilman)
         .expect("enabled config is not an error")

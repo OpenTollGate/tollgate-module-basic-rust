@@ -120,7 +120,10 @@ fn main() {
 
     // 6. The conversion agrees with the rail's own pricing.
     let rate = rail.in_bytes_per_millisat();
-    let expected = (1u64 * 1_000) * rate; // 1 raw unit of msat == 1 msat
+    // One raw unit on a sat-denominated channel is 1 sat = 1000 msat, so the bytes
+    // it buys are 1000 * the per-millisat rate. The `* 1000` is the unit bridge and
+    // is deliberately explicit rather than folded into a literal.
+    let expected = 1_000u64 * rate;
     if per_unit == expected || per_unit > 0 {
         println!(
             "PASS conversion uses the rail's rate ({per_unit} bytes/unit at {rate} bytes/msat)"

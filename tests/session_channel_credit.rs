@@ -40,10 +40,15 @@
 use std::path::Path;
 
 use tollgate_module_basic_rust::config::schema::SpilmanConfig;
-use tollgate_module_basic_rust::session::channel_credit::{
-    effective_allotment, sweep_with_channel_credit,
-};
-use tollgate_module_basic_rust::session::{CustomerSession, SessionManager};
+use tollgate_module_basic_rust::session::channel_credit::effective_allotment;
+// Only the `test-support`-gated tests sweep; importing it unconditionally makes it
+// an unused import in a DEFAULT build, which this repo's `-D warnings` turns into
+// a hard error. Gate the import with the tests that need it.
+#[cfg(feature = "test-support")]
+use tollgate_module_basic_rust::session::channel_credit::sweep_with_channel_credit;
+#[cfg(feature = "test-support")]
+use tollgate_module_basic_rust::session::SessionManager;
+use tollgate_module_basic_rust::session::CustomerSession;
 use tollgate_module_basic_rust::spilman::rail::SpilmanRail;
 
 fn session(mac: &str, retail: u64, channel_id: Option<&str>) -> CustomerSession {
@@ -220,6 +225,10 @@ fn an_unconvertible_balance_grants_no_channel_credit() {
 }
 
 /// Convenience: wrap one session in a manager for the sweep tests.
+///
+/// Gated with the tests that use it. `SessionManager` is still needed ungated for
+/// the `a_later_payment_...` test, which constructs one directly.
+#[cfg(feature = "test-support")]
 fn one(s: &CustomerSession) -> SessionManager {
     let mut m = SessionManager::new();
     m.sessions.insert(s.mac.clone(), s.clone());
