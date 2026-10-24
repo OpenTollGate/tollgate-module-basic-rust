@@ -15,6 +15,27 @@
 //! written. That is deliberate: it is the regression guard that proves the change did
 //! not quietly alter the retail path every existing customer uses. A feature test that
 //! only exercises the new path cannot tell you that.
+//!
+//! # Two of the seven tests need `test-support`, and that is stated, not hidden
+//!
+//! Tests that seed a balance have to get credit into the ledger somehow. The
+//! production `record_payment` refuses anything whose signature it cannot verify
+//! (that refusal is the fix for CRITICAL-UNVERIFIED-PAYMENT, and it is load-bearing),
+//! so a test cannot simply write a balance through it. The `test-support` feature
+//! exposes `record_payment_for_tests` for exactly this, and it is NOT in the default
+//! feature set — a shipped router binary must not carry a seam that bypasses
+//! signature verification.
+//!
+//! Consequence, stated plainly because silence here would be a coverage hole:
+//!
+//!   cargo test                                   -> 4 of 7 run
+//!   cargo test --features test-support           -> 7 of 7 run
+//!
+//! The four that run by default are the ones that need no credit: the rail-off
+//! regression guard, the no-rail case, the unknown-channel case, and the
+//! unconvertible-balance case. The three that need a funded channel are gated. CI
+//! must run the second command to cover the access path fully — the assertion that
+//! matters most (a funded channel raises the ceiling) cannot be reached without it.
 
 use std::path::Path;
 
@@ -89,6 +110,7 @@ fn unknown_channel_adds_no_credit_but_keeps_retail() {
 ///
 /// The number is computed by the rail's own pricing, so this test also pins that the
 /// access path and `authorize_bytes` agree on the rate.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_funded_channel_raises_the_ceiling() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -118,6 +140,7 @@ async fn a_funded_channel_raises_the_ceiling() {
 ///
 /// Once `used` exceeds retail + channel credit, the session is terminal — exactly like
 /// the old `used >= allotment` rule.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn exhausted_channel_credit_revokes_the_session() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -142,6 +165,7 @@ async fn exhausted_channel_credit_revokes_the_session() {
 
 /// A payment that lands AFTER the session started must extend the SAME session —
 /// no new gate-open, and the consumed `used` must not be forgotten.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_later_payment_extends_the_same_session_without_losing_usage() {
     let dir = tempfile::tempdir().expect("tempdir");

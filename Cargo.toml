@@ -27,6 +27,15 @@ name = "spilman-payer"
 path = "examples/spilman_payer.rs"
 required-features = ["payer-driver"]
 
+# The on-device proof that a channel's credit grants ACCESS. It records balances
+# through the `test-support` seam (the only way an integration-test-style binary
+# can seed credit without a real signature), so it is gated on that feature and
+# never built by a plain `cargo build`/`cargo test`.
+[[example]]
+name = "access_credit_probe"
+path = "examples/access_credit_probe.rs"
+required-features = ["test-support"]
+
 [features]
 # NOT in the default set, so a shipped binary does not contain the test seam.
 # Enables `SpilmanRail::record_payment_for_tests`, which bypasses signature
