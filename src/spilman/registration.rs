@@ -112,7 +112,11 @@ impl ChannelRegistrationRequest {
     /// carry either value, and deriving them needs a secret the payee should hand
     /// over explicitly rather than have a driver guess. `my_secret` is the payer's
     /// channel key; `their_pubkey_hex` is the payee's published one.
-    pub fn with_channel_secret(mut self, my_secret: &SecretKey, their_pubkey_hex: &str) -> Result<Self, SpilmanError> {
+    pub fn with_channel_secret(
+        mut self,
+        my_secret: &SecretKey,
+        their_pubkey_hex: &str,
+    ) -> Result<Self, SpilmanError> {
         let their_pubkey: cashu::nuts::PublicKey = their_pubkey_hex.parse().map_err(|e| {
             invalid(
                 &self.channel_id,
@@ -203,12 +207,9 @@ pub fn validate_registration(
 
     let secret = decode_channel_secret(channel_id, &req.channel_secret_hex)?;
 
-    let params = ChannelParameters::from_json_with_channel_secret(
-        &req.params_json,
-        keyset_info,
-        secret,
-    )
-    .map_err(|e| invalid(channel_id, &format!("params_json: {e}")))?;
+    let params =
+        ChannelParameters::from_json_with_channel_secret(&req.params_json, keyset_info, secret)
+            .map_err(|e| invalid(channel_id, &format!("params_json: {e}")))?;
 
     // The id is *derived* from the record, never taken from the request: this is
     // the check that stops one channel's bytes from registering under another's id.
@@ -247,8 +248,12 @@ pub fn validate_registration(
 
     // Structural only: must be a JSON array of proofs. Their cryptographic
     // validity is decided by upstream's validator when a payment is recorded.
-    serde_json::from_str::<Vec<serde_json::Value>>(&req.funding_proofs_json)
-        .map_err(|e| invalid(channel_id, &format!("funding_proofs_json is not a JSON array: {e}")))?;
+    serde_json::from_str::<Vec<serde_json::Value>>(&req.funding_proofs_json).map_err(|e| {
+        invalid(
+            channel_id,
+            &format!("funding_proofs_json is not a JSON array: {e}"),
+        )
+    })?;
 
     Ok(ChannelFundingRecord {
         channel_id: channel_id.to_string(),
@@ -293,9 +298,12 @@ pub(crate) mod test_support {
         // A v1 keyset id: 8 bytes, hex. Mint keys are arbitrary here because
         // `from_json_with_channel_secret` only checks that params and keyset agree.
         let keys = cashu::nuts::Keys::new(
-            [(cashu::Amount::from(1u64), SecretKey::generate().public_key())]
-                .into_iter()
-                .collect(),
+            [(
+                cashu::Amount::from(1u64),
+                SecretKey::generate().public_key(),
+            )]
+            .into_iter()
+            .collect(),
         );
         let keyset_id = Id::v1_from_keys(&keys);
         let input_fee_ppk = 0u64;

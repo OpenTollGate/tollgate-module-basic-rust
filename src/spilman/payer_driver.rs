@@ -38,9 +38,7 @@ impl PayeeClient {
     pub fn new(base_url: &str) -> Result<Self, SpilmanError> {
         let trimmed = base_url.trim_end_matches('/');
         if trimmed.is_empty() {
-            return Err(SpilmanError::Config(
-                "payee base URL is empty".to_string(),
-            ));
+            return Err(SpilmanError::Config("payee base URL is empty".to_string()));
         }
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))

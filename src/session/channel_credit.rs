@@ -27,7 +27,7 @@
 //! added", never to "assume the retail allotment is still fine". A failure to read a
 //! payment is not evidence of payment.
 
-use super::{CustomerSession, SessionManager, terminal_sessions};
+use super::{terminal_sessions, CustomerSession, SessionManager};
 
 /// Bytes of access a channel's verified balance buys, in the unit `allotment` uses.
 ///
@@ -36,7 +36,10 @@ use super::{CustomerSession, SessionManager, terminal_sessions};
 /// is deliberately distinct from `Some(0)`: "we cannot say" and "it buys nothing" lead
 /// to the same denial here, but keeping them distinct means a future caller cannot
 /// accidentally treat an error as a confirmed zero.
-pub fn channel_credit_bytes(rail: &crate::spilman::rail::SpilmanRail, channel_id: &str) -> Option<u64> {
+pub fn channel_credit_bytes(
+    rail: &crate::spilman::rail::SpilmanRail,
+    channel_id: &str,
+) -> Option<u64> {
     let balance = rail.channel_balance(channel_id).ok()??;
     // The rail's own pricing is the single source of truth for "how many bytes does
     // this balance buy" — the same function `authorize_bytes` uses, so the access path

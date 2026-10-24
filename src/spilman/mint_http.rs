@@ -114,7 +114,10 @@ impl ActiveKeyset {
     /// Denominations as `Amount`-free `u64`s, which is what `PreMintSecrets`
     /// wants for its split target.
     pub fn denominations(&self) -> Vec<u64> {
-        self.keys.iter().map(|(amount, _)| amount.to_u64()).collect()
+        self.keys
+            .iter()
+            .map(|(amount, _)| amount.to_u64())
+            .collect()
     }
 }
 
@@ -247,13 +250,9 @@ impl RemoteMint {
         // denomination list is the split target's alphabet.
         let fees: cdk::amount::FeeAndAmounts =
             (keyset.input_fee_ppk, keyset.denominations()).into();
-        let premint = PreMintSecrets::random(
-            keyset.id,
-            Amount::from(amount),
-            &SplitTarget::None,
-            &fees,
-        )
-        .map_err(|e| SpilmanError::Mint(format!("split {amount} sat into outputs: {e}")))?;
+        let premint =
+            PreMintSecrets::random(keyset.id, Amount::from(amount), &SplitTarget::None, &fees)
+                .map_err(|e| SpilmanError::Mint(format!("split {amount} sat into outputs: {e}")))?;
 
         let quote_request = MintQuoteRequest::Bolt11(MintQuoteBolt11Request {
             amount: Amount::from(amount),
@@ -377,8 +376,14 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut map = BTreeMap::new();
-        map.insert(Amount::from(1), cdk::nuts::SecretKey::generate().public_key());
-        map.insert(Amount::from(2), cdk::nuts::SecretKey::generate().public_key());
+        map.insert(
+            Amount::from(1),
+            cdk::nuts::SecretKey::generate().public_key(),
+        );
+        map.insert(
+            Amount::from(2),
+            cdk::nuts::SecretKey::generate().public_key(),
+        );
         let keyset = ActiveKeyset {
             id: "00ad268c4d1f5826".parse().expect("keyset id"),
             keys: cdk::nuts::Keys::new(map),

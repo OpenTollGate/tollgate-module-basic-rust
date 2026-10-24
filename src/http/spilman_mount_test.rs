@@ -59,7 +59,9 @@ fn build_state(cfg: Config, spilman: Option<Arc<SpilmanRail>>) -> AppState {
             secret_key: sk,
         }),
         wallet: Arc::new(tokio::sync::Mutex::new(None)),
-        sessions: Arc::new(tokio::sync::Mutex::new(crate::session::SessionManager::new())),
+        sessions: Arc::new(tokio::sync::Mutex::new(
+            crate::session::SessionManager::new(),
+        )),
         quotes: Arc::new(std::sync::Mutex::new(
             crate::http::routes::quote::MintQuoteRegistry::new(),
         )),
@@ -114,10 +116,7 @@ async fn post_json_body(router: axum::Router, uri: &str, body: &str) -> (StatusC
 /// The load-bearing assertion: with the rail OFF, the surface does not exist.
 #[tokio::test]
 async fn every_spilman_path_404s_when_disabled() {
-    for uri in [
-        "/spilman/params",
-        "/spilman/status?channel_id=deadbeef",
-    ] {
+    for uri in ["/spilman/params", "/spilman/status?channel_id=deadbeef"] {
         let code = get(create_test_router(state_disabled()), uri).await;
         assert_eq!(
             code,
@@ -142,9 +141,13 @@ async fn every_spilman_path_404s_when_disabled() {
     // same rule: no rail -> no route -> 404, with no handler running. A body that
     // would otherwise be a perfectly good registration must still 404 here.
     let (_, body, _) = registration();
-    let code = post_json_body(create_test_router(state_disabled()), "/spilman/channel", &body)
-        .await
-        .0;
+    let code = post_json_body(
+        create_test_router(state_disabled()),
+        "/spilman/channel",
+        &body,
+    )
+    .await
+    .0;
     assert_eq!(
         code,
         StatusCode::NOT_FOUND,
@@ -173,7 +176,11 @@ async fn retail_routes_are_unaffected_either_way() {
 #[tokio::test]
 async fn spilman_paths_respond_when_enabled() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let code = get(create_test_router(state_enabled(dir.path())), "/spilman/params").await;
+    let code = get(
+        create_test_router(state_enabled(dir.path())),
+        "/spilman/params",
+    )
+    .await;
     assert_eq!(
         code,
         StatusCode::OK,
@@ -224,12 +231,8 @@ async fn registering_a_channel_makes_status_find_it() {
         "an unregistered channel must be unknown to /status"
     );
 
-    let (code, response) = post_json_body(
-        create_test_router(state.clone()),
-        "/spilman/channel",
-        &body,
-    )
-    .await;
+    let (code, response) =
+        post_json_body(create_test_router(state.clone()), "/spilman/channel", &body).await;
     assert_eq!(
         code,
         StatusCode::OK,
@@ -318,8 +321,12 @@ async fn a_duplicate_with_different_data_is_refused_and_does_not_overwrite() {
     forged.funding_proofs_json = r#"[{"amount":1,"id":"00","secret":"x","C":"00"}]"#.to_string();
     let forged_body = serde_json::to_string(&forged).expect("serialize forged");
 
-    let second =
-        post_json_body(create_test_router(state.clone()), "/spilman/channel", &forged_body).await;
+    let second = post_json_body(
+        create_test_router(state.clone()),
+        "/spilman/channel",
+        &forged_body,
+    )
+    .await;
     assert_eq!(
         second.0,
         StatusCode::CONFLICT,
@@ -376,9 +383,15 @@ async fn a_malformed_registration_is_400_and_persists_nothing() {
 
     for (bad, label) in [
         ("not json at all".to_string(), "not JSON"),
-        (r#"{"hello":"world"}"#.to_string(), "JSON, but not a registration"),
+        (
+            r#"{"hello":"world"}"#.to_string(),
+            "JSON, but not a registration",
+        ),
         (unbound_body, "an id its own params do not derive"),
-        (mismatched_id_body, "a valid body relabelled with another id"),
+        (
+            mismatched_id_body,
+            "a valid body relabelled with another id",
+        ),
     ] {
         let (code, response) =
             post_json_body(create_test_router(state.clone()), "/spilman/channel", &bad).await;
@@ -412,7 +425,9 @@ async fn a_registration_in_an_unsupported_unit_is_refused() {
     let state = state_enabled(dir.path());
 
     let (mut req, _, _) = registration();
-    req.params_json = req.params_json.replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");
+    req.params_json = req
+        .params_json
+        .replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");
     req.keyset_info_json = req
         .keyset_info_json
         .replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");

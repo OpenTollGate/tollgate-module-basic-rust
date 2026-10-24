@@ -144,4 +144,3 @@ mod spilman_mount_test;
 
 #[cfg(test)]
 mod wire_identity_test;
-

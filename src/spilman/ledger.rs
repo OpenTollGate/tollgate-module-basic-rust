@@ -449,8 +449,13 @@ impl ChannelLedger {
             .optional()
             .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
 
-        if let Some((params_json, funding_proofs_json, channel_secret_hex, keyset_info_json, capacity)) =
-            existing
+        if let Some((
+            params_json,
+            funding_proofs_json,
+            channel_secret_hex,
+            keyset_info_json,
+            capacity,
+        )) = existing
         {
             // `created_at` is deliberately NOT compared: it is the payee's own clock,
             // not the payer's data, so including it would turn every honest retry into

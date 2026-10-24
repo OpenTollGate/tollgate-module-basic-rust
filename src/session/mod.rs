@@ -254,15 +254,90 @@ impl SessionManager {
         metric: &str,
         ttl_secs: u64,
     ) -> Option<u64> {
-        let (used, total) = {
+        // Extend the RETAIL half only. `allotment` is the EFFECTIVE ceiling --
+        // retail plus whatever a bound channel has verifiably paid for -- so adding
+        // `extra` to it would fold channel credit into retail. Measured
+        // consequence of getting this wrong (found in cold review): a session with
+        // retail=1000 and a channel worth 22_021_000 bytes became
+        // retail=22_023_000 with channel_id=None, so the channel's credit turned
+        // into token money and SURVIVED the rail being switched off. That
+        // falsified both "bit-identical when off" and "the channel raises a floor,
+        // it never lowers it".
+        let (used, retail, channel_id) = {
             let s = self.sessions.get(mac)?;
-            (s.used, s.allotment.saturating_add(extra))
+            (
+                s.used,
+                s.retail_allotment.saturating_add(extra),
+                s.channel_id.clone(),
+            )
         };
-        // `create_session` persists the row; restore `used` afterwards so the extension
-        // is additive rather than resetting the client's consumption to zero.
-        self.create_session(mac, total, metric, ttl_secs);
+        // `create_session` persists the row; restore the channel binding and `used`
+        // afterwards so the extension is additive, does not reset the client's
+        // consumption to zero, and does not silently unbind a channel.
+        self.create_session(mac, retail, metric, ttl_secs);
         self.update_usage(mac, used);
-        Some(total)
+        // Re-establish the binding: `create_session` deliberately defaults to the
+        // retail path, and an EXTENSION is not a re-grant.
+        let effective = {
+            let Some(s) = self.sessions.get_mut(mac) else {
+                return Some(retail);
+            };
+            s.channel_id = channel_id;
+            s.retail_allotment = retail;
+            // The effective ceiling is recomputed by the sweep from the channel's
+            // verified balance; until then it must not exceed what is actually
+            // granted, so it is the retail number here.
+            s.allotment = retail;
+            s.allotment
+        };
+        if let Some(st) = &self.store {
+            if let Some(s) = self.sessions.get(mac) {
+                if let Err(e) = st.upsert_session(s) {
+                    tracing::warn!(mac = %mac, error = %e,
+                        "extend_session: could not persist the rebound session");
+                }
+            }
+        }
+        Some(effective)
+    }
+
+    /// Bind or unbind a live session's channel.
+    ///
+    /// # Why this exists
+    ///
+    /// It is the ONLY production writer of `CustomerSession.channel_id`. Before it,
+    /// the field was set to `None` at creation and never assigned again, so
+    /// `effective_allotment` always returned at its first branch: the access-path
+    /// wiring was correct and unreachable, and a channel bought a client nothing.
+    /// A cold review found this; the unit tests could not, because they set the
+    /// field directly.
+    ///
+    /// # What it deliberately does not do
+    ///
+    /// It grants nothing. `allotment` is left alone here; the sweep recomputes the
+    /// effective ceiling from the channel's VERIFIED balance on its next tick. A
+    /// binding to a channel with no credit is therefore a binding worth zero bytes,
+    /// which is the right answer -- the binding is a pointer, not a payment.
+    ///
+    /// Returns `Ok(None)` when there is no live session for the MAC: a binding
+    /// attaches to an existing session and must never be how access is created.
+    pub fn bind_channel(&mut self, mac: &str, channel_id: &str) -> Result<Option<u64>, StoreError> {
+        let Some(s) = self.sessions.get_mut(mac) else {
+            return Ok(None);
+        };
+        s.channel_id = Some(channel_id.to_string());
+        // Effective ceiling is unchanged until the sweep reads the channel. Keeping
+        // `allotment` at the retail number here means a binding can never RAISE
+        // access before a verified balance has been seen.
+        let effective = s.allotment;
+        let snapshot = s.clone();
+        if let Some(st) = &self.store {
+            // Persist before returning: an in-memory-only binding would vanish on
+            // restart and silently stop drawing on a channel the payer believes is
+            // funding them.
+            st.upsert_session(&snapshot)?;
+        }
+        Ok(Some(effective))
     }
 
     pub fn is_active(&self, mac: &str) -> bool {

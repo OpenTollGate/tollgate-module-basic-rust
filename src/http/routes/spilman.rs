@@ -50,10 +50,14 @@ pub struct ParamsResponse {
 
 pub async fn handle_params(State(state): State<AppState>) -> impl IntoResponse {
     match rail(&state) {
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response(),
         Some(r) => Json(ParamsResponse {
             status: 1,
             mint_url: r.mint_url().map(str::to_string),
@@ -83,24 +87,35 @@ pub async fn handle_payment(
     Json(req): Json<PaymentRequest>,
 ) -> impl IntoResponse {
     let Some(r) = rail(&state) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response();
     };
 
     // The rail decides. A refusal is a 409, not a 500: the request was well-formed
     // and the answer is "no", which is a different fact from "we broke".
-    match r.record_payment(&req.channel_id, req.balance, &req.signature).await {
+    match r
+        .record_payment(&req.channel_id, req.balance, &req.signature)
+        .await
+    {
         Ok(outcome) => Json(PaymentResponse {
             status: 1,
             outcome: format!("{outcome:?}"),
         })
         .into_response(),
-        Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({
-            "status": 0,
-            "error": e.to_string()
-        }))).into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -159,10 +174,14 @@ pub async fn handle_register_channel(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let Some(r) = rail(&state) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response();
     };
 
     // The only parse in this handler. A body that is not a registration is a
@@ -170,10 +189,14 @@ pub async fn handle_register_channel(
     let req: crate::spilman::ChannelRegistrationRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "status": 0,
-                "error": format!("malformed registration body: {e}")
-            }))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": format!("malformed registration body: {e}")
+                })),
+            )
+                .into_response()
         }
     };
 
@@ -194,29 +217,37 @@ pub async fn handle_register_channel(
         .into_response(),
         // 409 for "this id exists with different funding data": the request was
         // well-formed and the answer is "no". Never a silent overwrite.
-        Err(e @ SpilmanError::ChannelAlreadyRegistered { .. }) => {
-            (StatusCode::CONFLICT, Json(serde_json::json!({
+        Err(e @ SpilmanError::ChannelAlreadyRegistered { .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
                 "status": 0,
                 "error": e.to_string()
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
         // 400 for a body that cannot become a usable record. Malformed JSON is
         // rejected by axum's extractor before the handler runs (also 400).
-        Err(e @ SpilmanError::InvalidRegistration { .. }) => {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+        Err(e @ SpilmanError::InvalidRegistration { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
                 "status": 0,
                 "error": e.to_string()
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
         // A store failure is ours, not the caller's, and it must not read as a
         // successful registration: 500 with the reason.
         Err(e) => {
             tracing::error!(channel_id = %req.channel_id, error = %e,
                 "spilman channel registration failed to persist");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "status": 0,
-                "error": e.to_string()
-            }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": e.to_string()
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -241,10 +272,14 @@ pub async fn handle_status(
     axum::extract::Query(q): axum::extract::Query<StatusQuery>,
 ) -> impl IntoResponse {
     let Some(r) = rail(&state) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response();
     };
 
     // "Is this channel known?" is a question about the **funding record**, not the
@@ -261,24 +296,48 @@ pub async fn handle_status(
             // tell a payer its funded channel does not exist.
             tracing::error!(channel_id = %q.channel_id, error = %e,
                 "spilman funding read failed; refusing to answer /status");
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "status": 0,
-                "error": "channel ledger unreadable"
-            })))
-            .into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": "channel ledger unreadable"
+                })),
+            )
+                .into_response();
         }
     };
     if !known {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "unknown channel"
-        })))
-        .into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "unknown channel"
+            })),
+        )
+            .into_response();
     }
 
     // Known: report the credit decision and the balance it is derived from.
     let decision = r.authorize_bytes(&q.channel_id, 0, 0).await;
-    let balance = r.channel_balance(&q.channel_id).unwrap_or(None);
+    // A failed READ is not "no balance". `unwrap_or(None)` mapped a ledger error to
+    // `balance: null`, which reads as "registered but never paid" -- the opposite
+    // of what happened -- and contradicted the 500 the funding read above returns
+    // for the same class of failure.
+    let balance = match r.channel_balance(&q.channel_id) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(channel_id = %q.channel_id, error = %e,
+                "spilman balance read failed; refusing to answer /status");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": "channel ledger unreadable"
+                })),
+            )
+                .into_response();
+        }
+    };
     Json(serde_json::json!({
         "status": 1,
         "channel_id": q.channel_id,
@@ -300,4 +359,123 @@ pub fn spilman_router() -> axum::Router<AppState> {
         .route("/channel", axum::routing::post(handle_register_channel))
         .route("/payment", axum::routing::post(handle_payment))
         .route("/status", axum::routing::get(handle_status))
+        // The ONE production writer of `CustomerSession.channel_id`. Without it the
+        // access path is wired and unreachable.
+        .route("/access", axum::routing::post(handle_bind_access))
+}
+
+// ── the ACCESS binding: MAC -> channel ────────────────────────────────────────
+//
+// WHY THIS ROUTE EXISTS
+//
+// A cold review found the feature unreachable: `channel_id` was set to `None` at
+// `session/mod.rs:181` and **nothing in production ever assigned a non-None
+// value**. The access-path unit tests set the field directly, so they passed
+// while no real router could ever bind a client to a channel. `effective_allotment`
+// therefore always returned at its first branch, and a channel bought a client
+// nothing -- exactly the gap the access-path work was supposed to close, reopened
+// one layer up.
+//
+// This route is the missing writer. It is the whole point of the surface: without
+// it, `/spilman/channel` registers a channel nobody can spend and `/spilman/payment`
+// records credit no session can draw on.
+
+/// POST /spilman/access — bind a client MAC to a Spilman channel.
+#[derive(Debug, Deserialize)]
+pub struct AccessRequest {
+    /// The client whose access this channel funds.
+    pub mac: String,
+    /// The channel that pays for it. Must already be registered.
+    pub channel_id: String,
+}
+
+/// Bind (or unbind) a MAC's access to a channel.
+///
+/// # What this does NOT do
+///
+/// It does not grant access and does not open a gate. It records *which channel
+/// pays for this client*; whether the client is served is decided by the sweep,
+/// which recomputes the effective ceiling from the channel's **verified** balance
+/// every tick. A binding to a channel with no verified credit buys nothing, which
+/// is the correct outcome: the binding is a pointer, not a payment.
+///
+/// # Why the channel must already be registered
+///
+/// Binding to an unknown id would create a session that can never be credited and
+/// whose refusal reason would be indistinguishable from a typo. Refusing here
+/// names the problem at the point it is introduced.
+pub async fn handle_bind_access(
+    State(state): State<AppState>,
+    Json(req): Json<AccessRequest>,
+) -> impl IntoResponse {
+    let Some(r) = rail(&state) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    // An unreadable ledger must not be reported as "unknown channel": that would
+    // blame the caller for our failure.
+    match r.is_known_channel(&req.channel_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": "unknown channel",
+                    "channel_id": req.channel_id
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(channel_id = %req.channel_id, error = %e,
+                "spilman funding read failed; refusing to bind access");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": "channel ledger unreadable"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let mut sessions = state.sessions.lock().await;
+    match sessions.bind_channel(&req.mac, &req.channel_id) {
+        Ok(Some(effective)) => Json(serde_json::json!({
+            "status": 1,
+            "mac": req.mac,
+            "channel_id": req.channel_id,
+            // The ceiling the sweep will honour until it next recomputes from the
+            // channel's verified balance. Stated so the caller can see that
+            // binding alone grants no bytes.
+            "effective_allotment": effective,
+        }))
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "no live session for this mac; a binding attaches to an \
+                          existing session and does not create access"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }

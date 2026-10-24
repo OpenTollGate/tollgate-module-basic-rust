@@ -46,9 +46,9 @@ use tollgate_module_basic_rust::session::channel_credit::effective_allotment;
 // a hard error. Gate the import with the tests that need it.
 #[cfg(feature = "test-support")]
 use tollgate_module_basic_rust::session::channel_credit::sweep_with_channel_credit;
+use tollgate_module_basic_rust::session::CustomerSession;
 #[cfg(feature = "test-support")]
 use tollgate_module_basic_rust::session::SessionManager;
-use tollgate_module_basic_rust::session::CustomerSession;
 use tollgate_module_basic_rust::spilman::rail::SpilmanRail;
 
 fn session(mac: &str, retail: u64, channel_id: Option<&str>) -> CustomerSession {
@@ -159,7 +159,10 @@ async fn exhausted_channel_credit_revokes_the_session() {
 
     // Under the ceiling: alive. At the ceiling: terminal.
     s.used = ceiling - 1;
-    assert_eq!(sweep_with_channel_credit(&mut one(&s), Some(&rail), 0).len(), 0);
+    assert_eq!(
+        sweep_with_channel_credit(&mut one(&s), Some(&rail), 0).len(),
+        0
+    );
     s.used = ceiling;
     assert_eq!(
         sweep_with_channel_credit(&mut one(&s), Some(&rail), 0),
@@ -193,17 +196,25 @@ async fn a_later_payment_extends_the_same_session_without_losing_usage() {
     rail.record_payment_for_tests("chan-growing", 1, "sig-1")
         .expect("record");
     let horizon = rail.bytes_for_raw_balance(1).expect("rate");
-    assert!(horizon > 500, "the payment must cover the usage for this test to mean anything");
+    assert!(
+        horizon > 500,
+        "the payment must cover the usage for this test to mean anything"
+    );
 
     assert!(
         sweep_with_channel_credit(&mut sessions, Some(&rail), 0).is_empty(),
         "the payment must revive the SAME session"
     );
-    let kept = sessions.sessions.get("aa:bb:cc:dd:ee:05").expect("still there");
-    assert_eq!(kept.used, 500, "usage must survive; reviving is not a re-grant");
+    let kept = sessions
+        .sessions
+        .get("aa:bb:cc:dd:ee:05")
+        .expect("still there");
     assert_eq!(
-        kept.allotment,
-        horizon,
+        kept.used, 500,
+        "usage must survive; reviving is not a re-grant"
+    );
+    assert_eq!(
+        kept.allotment, horizon,
         "the ceiling must now be the channel's verified credit"
     );
 }

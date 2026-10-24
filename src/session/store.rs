@@ -243,12 +243,10 @@ impl SessionStore {
 
     /// Load every session. Recovery decisions are the caller's job.
     pub fn load_sessions(&self) -> Result<Vec<CustomerSession>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT mac, allotment, used, metric, expiry, granted_at, \
+        let mut stmt = self.conn.prepare(
+            "SELECT mac, allotment, used, metric, expiry, granted_at, \
                  retail_allotment, channel_id FROM sessions",
-            )?;
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(CustomerSession {
                 mac: r.get(0)?,

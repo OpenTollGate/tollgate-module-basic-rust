@@ -98,7 +98,10 @@ struct LivePayee {
     _mint_server: AbortOnDrop,
     client: PayeeClient,
     rail: Arc<SpilmanRail>,
-    bridge: SpilmanClientBridge<ConfigurableClientHost<SqliteClientStorage>, cdk_spilman::ReqwestClientNetworking>,
+    bridge: SpilmanClientBridge<
+        ConfigurableClientHost<SqliteClientStorage>,
+        cdk_spilman::ReqwestClientNetworking,
+    >,
     channel_id: String,
     registration: ChannelRegistrationRequest,
 }
@@ -346,7 +349,9 @@ async fn a_channel_registered_over_http_accepts_a_real_payment() {
         "the payee's durable balance must be exactly what was signed: {status}"
     );
     assert_eq!(
-        live.rail.authorize_bytes(&live.channel_id, 22_021_000, 0).await,
+        live.rail
+            .authorize_bytes(&live.channel_id, 22_021_000, 0)
+            .await,
         RailDecision::Allow,
         "1 sat must buy exactly 22_021_000 bytes at the parity rate"
     );
@@ -449,7 +454,9 @@ async fn a_non_sat_channel_is_refused_over_http() {
     // A coherent `usd` channel cannot be built by mutating this one (the id binds the
     // unit), so the body is expected to fail on the id or on the unit — either way it
     // is a 400 and not a stored record.
-    req.params_json = req.params_json.replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");
+    req.params_json = req
+        .params_json
+        .replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");
     req.keyset_info_json = req
         .keyset_info_json
         .replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");
