@@ -84,6 +84,7 @@
 //! next (a channel that did not open cannot be registered; a payment the payee
 //! refused must not be followed by a "settled" line), so continuing past a failure
 //! would produce a log that reads like a run and isn't one.
+//! Never use real funds: payer state (including returned change proofs) is temporary.
 
 use cashu::nuts::SecretKey;
 use cdk_spilman::{parse_keyset_info_from_json, ConfigurableClientHost, SpilmanClientBridge};
@@ -335,6 +336,26 @@ async fn phase_gate(dir: Option<&std::path::Path>, phase: &str) {
         eprintln!("FAILED waiting for {}", gate.display());
         exit_with(1);
     }
+}
+
+async fn submit_close(
+    payee_url: &str,
+    payment: &cdk_spilman::Payment,
+) -> Result<String, SpilmanError> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| SpilmanError::Bridge(e.to_string()))?;
+    http.post(format!("{}/spilman/close", payee_url.trim_end_matches('/')))
+        .json(payment)
+        .send()
+        .await
+        .map_err(|e| SpilmanError::Bridge(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| SpilmanError::Bridge(e.to_string()))?
+        .text()
+        .await
+        .map_err(|e| SpilmanError::Bridge(e.to_string()))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -637,7 +658,22 @@ async fn main() {
     ));
 
     phase_gate(phase_dir.as_deref(), "paid").await;
-    marker("PAYER_SETTLEMENT_NOT_IMPLEMENTED");
+    let settlement = match payer::CooperativeSettlement::from_accepted_payment(&client, &payment) {
+        Ok(settlement) => settlement,
+        Err(e) => fail("sign cooperative close", &e),
+    };
+    let response = match submit_close(&payee_url, settlement.payment()).await {
+        Ok(response) => response,
+        Err(e) => fail("POST /spilman/close", &e),
+    };
+    let receipt = match settlement.complete(&client, &response) {
+        Ok(receipt) => receipt,
+        Err(e) => fail("verify cooperative close", &e),
+    };
+    marker(&format!(
+        "PAYER_SETTLED channel_id={channel_id} receiver_sum={} sender_sum={} total_value={}",
+        receipt.receiver_sum, receipt.sender_sum, receipt.total_value
+    ));
     println!();
     println!(
         "OK: channel {channel_id} opened at {}, registered, paid {PAYMENT_RAW_UNITS} raw unit(s), \
@@ -697,6 +733,22 @@ mod tests {
             seller_mint("https://seller-mint/", "https://seller-mint").unwrap(),
             "https://seller-mint"
         );
+    }
+
+    #[tokio::test]
+    async fn close_transport_rejects_http_failure() {
+        let app = axum::Router::new().route(
+            "/spilman/close",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::CONFLICT, "mint rejected close")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let payment = cdk_spilman::Payment::new("test".into(), 1, "invalid".into());
+        assert!(submit_close(&url, &payment).await.is_err());
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -188,6 +188,23 @@ async fn spilman_paths_respond_when_enabled() {
     );
 }
 
+#[tokio::test]
+async fn close_authenticates_before_contacting_mint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, body) = post_json_body(
+        create_test_router(state_enabled(dir.path())),
+        "/spilman/close",
+        r#"{"channel_id":"deadbeef","balance":1,"signature":"00"}"#,
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert!(!body.contains("proofs"));
+    assert_eq!(
+        post_json(create_test_router(state_disabled()), "/spilman/close", "{}").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
 // ── POST /spilman/channel — registration ──────────────────────────────────
 //
 // The unit-level pins for the registration surface. The proof that a *real*

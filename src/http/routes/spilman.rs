@@ -349,6 +349,92 @@ pub async fn handle_status(
     .into_response()
 }
 
+/// POST /spilman/close — only a durably completed close returns a receipt.
+pub async fn handle_close(
+    State(state): State<AppState>,
+    Json(payment): Json<cdk_spilman::Payment>,
+) -> axum::response::Response {
+    let Some(r) = rail(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let refuse = |status, message: &str| {
+        (status, Json(serde_json::json!({"error": message}))).into_response()
+    };
+    match r.authenticated_close_receipt(&payment) {
+        Ok(Some(receipt)) => return Json(receipt).into_response(),
+        Ok(None) => {}
+        Err(_) => return refuse(StatusCode::CONFLICT, "close authorization refused"),
+    }
+    // Recovery uses the journal's exact outputs; never discover new keys for it.
+    if r.close_status(&payment.channel_id).is_err() {
+        use cdk_spilman::configurable_networking::{
+            build_keyset_info_json, fetch_all_keysets_from_mint,
+        };
+        let Some(mint) = r.mint_url() else {
+            return refuse(StatusCode::CONFLICT, "mint not configured");
+        };
+        let discovery = match fetch_all_keysets_from_mint(mint).await {
+            Ok(v) => v,
+            Err(_) => return refuse(StatusCode::BAD_GATEWAY, "mint keyset discovery failed"),
+        };
+        let now = crate::spilman::payer::now_seconds();
+        let Some(keys) = discovery.keysets.iter().find(|k| {
+            k.active
+                && k.unit == cashu::nuts::CurrencyUnit::Sat
+                && k.final_expiry.map_or(true, |expiry| expiry > now)
+        }) else {
+            return refuse(StatusCode::BAD_GATEWAY, "no usable mint keyset");
+        };
+        let info = build_keyset_info_json(
+            &keys.id,
+            &keys.unit,
+            &keys.keys,
+            keys.input_fee_ppk,
+            keys.final_expiry,
+        );
+        if r.prepare_close(
+            &payment.channel_id,
+            payment.balance,
+            &payment.signature,
+            &info,
+        )
+        .is_err()
+        {
+            return refuse(StatusCode::CONFLICT, "close preparation refused");
+        }
+    }
+    // The upstream synchronous adapter bridges into Tokio. Keep SQLite and
+    // blocking network work off the HTTP task, including on current-thread tests.
+    let execution_rail = r.clone();
+    let id = payment.channel_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let network = cdk_spilman::configurable_networking::ReqwestClientNetworking::new(
+            std::time::Duration::from_secs(15),
+        )
+        .map_err(|e| e.to_string())?;
+        execution_rail
+            .execute_close_with_network(&id, &network)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    if !matches!(result, Ok(Ok(_))) {
+        return refuse(
+            StatusCode::BAD_GATEWAY,
+            "close incomplete; retry the same authorized payment",
+        );
+    }
+    match r.authenticated_close_receipt(&payment) {
+        Ok(Some(mut receipt)) => {
+            receipt.already_closed = false;
+            Json(receipt).into_response()
+        }
+        _ => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable close receipt unavailable",
+        ),
+    }
+}
+
 /// Build the `/spilman` sub-router.
 ///
 /// Mounted by `create_router` **only when the rail exists**, so a disabled rail
@@ -358,6 +444,7 @@ pub fn spilman_router() -> axum::Router<AppState> {
         .route("/params", axum::routing::get(handle_params))
         .route("/channel", axum::routing::post(handle_register_channel))
         .route("/payment", axum::routing::post(handle_payment))
+        .route("/close", axum::routing::post(handle_close))
         .route("/status", axum::routing::get(handle_status))
         // The ONE production writer of `CustomerSession.channel_id`. Without it the
         // access path is wired and unreachable.
