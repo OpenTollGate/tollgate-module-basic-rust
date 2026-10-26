@@ -381,7 +381,7 @@ pub async fn handle_close(
         let Some(keys) = discovery.keysets.iter().find(|k| {
             k.active
                 && k.unit == cashu::nuts::CurrencyUnit::Sat
-                && k.final_expiry.map_or(true, |expiry| expiry > now)
+                && k.final_expiry.is_none_or(|expiry| expiry > now)
         }) else {
             return refuse(StatusCode::BAD_GATEWAY, "no usable mint keyset");
         };

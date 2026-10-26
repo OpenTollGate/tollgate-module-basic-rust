@@ -263,7 +263,7 @@ async fn payer_cooperative_settle_validates_receipt_and_ownership() {
 
         // ...and records it durably BEFORE serving any byte.
         ledger
-            .record_payment(&channel_id, payment.balance, &payment.signature)
+            .record_payment_unverified(&channel_id, payment.balance, &payment.signature)
             .expect("durable ledger write");
         assert_eq!(
             ledger.get_balance(&channel_id).expect("balance"),
