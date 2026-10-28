@@ -271,6 +271,25 @@ fn missing_config_file_returns_none() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A config that EXISTS but is unparseable is an ERROR, not a missing file:
+/// main() fails closed on Err precisely because treating it as missing
+/// would silently serve Config::default() — whose accepted mint is an
+/// arbitrary production mint. This pins the distinction the fix relies on.
+/// (A torn cross-device write is exactly this case: present, partial,
+/// invalid.)
+#[test]
+fn corrupt_config_file_is_an_error_not_none() {
+    let _g = env_guard();
+    let dir = std::env::temp_dir().join(format!("tollgate-corrupt-{}", rand_hex()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.json"), "{\"config_version\": \"v0.0.").unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
+    let loaded = load_config();
+    assert!(loaded.is_err(), "partial JSON must be Err, not Ok(None)");
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn empty_config_file_returns_none() {
     let _g = env_guard();

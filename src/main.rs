@@ -16,7 +16,49 @@ async fn main() {
     tracing::info!("RunInitialProbe: tollgate-module-basic-rust v{VERSION} starting");
 
     // Load config
-    let config_obj = config::load_config().unwrap_or(None).unwrap_or_default();
+    // Load config. A config that EXISTS but cannot be read or parsed fails
+    // closed (exit 78, like the session store): serving `Config::default()`
+    // would silently re-point the gateway at the default accepted mint — an
+    // arbitrary production mint — for as long as the bad read lasts. A
+    // config that is missing or empty is a first boot and keeps the
+    // default-config path.
+    //
+    // Torn writes (e.g. a non-atomic replace from another tool) are
+    // transient by nature: a bounded retry rides out the sub-second window
+    // so an operator mid-rewrite does not see a restart loop. Only a config
+    // that stays unreadable fails closed.
+    let mut config_load_error = String::new();
+    let config_obj = {
+        let mut loaded = None;
+        for attempt in 0..4 {
+            match config::load_config() {
+                Ok(Some(cfg)) => {
+                    loaded = Some(cfg);
+                    break;
+                }
+                Ok(None) => {
+                    loaded = Some(config::Config::default());
+                    break;
+                }
+                Err(e) => {
+                    config_load_error = e;
+                    if attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    }
+                }
+            }
+        }
+        match loaded {
+            Some(cfg) => cfg,
+            None => {
+                eprintln!(
+                    "FATAL: cannot load {} (4 attempts): {config_load_error}",
+                    config::config_path().display()
+                );
+                std::process::exit(78); // EX_CONFIG
+            }
+        }
+    };
     tracing::info!(
         metric = %config_obj.metric,
         mints = config_obj.accepted_mints.len(),
