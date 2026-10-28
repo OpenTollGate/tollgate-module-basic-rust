@@ -3,8 +3,25 @@
 //! Ported from tollgate-rs/crates/tollgate-net/src/wallet.rs (BootstrapWallet).
 //! Read-only: verifies proofs are unspent at the mint. No spending/receiving.
 
+use cashu::nuts::nut10::SpendingConditions;
 use cashu::nuts::Token;
 use std::collections::HashSet;
+
+/// True when any proof in the token carries NUT-10 spending conditions
+/// (P2PK / HTLC). Such proofs are locked to conditions this gateway cannot
+/// satisfy: receiving the token takes value the wallet can never spend
+/// upstream, so it is refused at parse time — the cheapest possible check,
+/// before any network call. Unparseable input reports `false` here and is
+/// rejected by the caller's own parse path with its error.
+pub fn token_is_locked(token_str: &str) -> bool {
+    let Ok(token) = token_str.parse::<Token>() else {
+        return false;
+    };
+    token
+        .token_secrets()
+        .iter()
+        .any(|s| SpendingConditions::try_from(*s).is_ok())
+}
 
 /// TLS 1.2 hard-pinned HTTP client (matches Go behavior — Go audit §2.4).
 fn build_http_client() -> reqwest::Client {
@@ -208,5 +225,69 @@ mod tests {
         let token: Token = sample_token().parse().expect("valid token");
         let sat: u64 = token.value().expect("value").into();
         assert_eq!(sat * 1_000, 1_000);
+    }
+
+    /// A locked proof wrapped in a real serialised cashuB V4 token, so the
+    /// detection is exercised over the actual wire format end to end.
+    fn locked_token_string(secret_json: &str) -> String {
+        use cashu::nuts::nut00::token::TokenV4Token;
+        use cashu::nuts::nut00::{Proof, TokenV4};
+        let secp = secp256k1::Secp256k1::new();
+        let (_sk, pk) = secp.generate_keypair(&mut rand::thread_rng());
+        let keyset_id: cashu::nuts::nut02::Id = "0093cbbc333111c4".parse().expect("keyset id");
+        let proof = Proof {
+            amount: cashu::Amount::from(1u64),
+            keyset_id,
+            secret: cashu::secret::Secret::new(secret_json),
+            // cashu's PublicKey comes from a different secp256k1 version than
+            // this crate's — convert through the serialized compressed form.
+            c: cashu::PublicKey::from_slice(&pk.serialize()).expect("pubkey"),
+            dleq: None,
+            p2pk_e: None,
+            witness: None,
+        };
+        let token = TokenV4 {
+            mint_url: "https://testnut.cashu.space".parse().expect("mint url"),
+            unit: cashu::CurrencyUnit::Sat,
+            memo: None,
+            token: vec![TokenV4Token {
+                keyset_id: keyset_id.into(),
+                proofs: vec![proof.into()],
+            }],
+        };
+        Token::TokenV4(token).to_string()
+    }
+
+    const P2PK_SECRET: &str = r#"["P2PK",{"nonce":"5d11913e","data":"026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198"}]"#;
+    const HTLC_SECRET: &str = r#"["HTLC",{"nonce":"abc123","data":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","tags":[["payment_hash","2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"]]}]"#;
+
+    #[test]
+    fn p2pk_locked_token_is_detected() {
+        let token = locked_token_string(P2PK_SECRET);
+        assert!(
+            super::token_is_locked(&token),
+            "a P2PK-conditioned token must be detected as locked"
+        );
+    }
+
+    #[test]
+    fn htlc_locked_token_is_detected() {
+        let token = locked_token_string(HTLC_SECRET);
+        assert!(
+            super::token_is_locked(&token),
+            "an HTLC-conditioned token must be detected as locked"
+        );
+    }
+
+    #[test]
+    fn ordinary_token_is_not_locked() {
+        assert!(!super::token_is_locked(&sample_token()));
+    }
+
+    #[test]
+    fn unparseable_input_is_not_reported_as_locked() {
+        // The caller's own parse path rejects garbage; this predicate answers
+        // only the lock question and must not crash or guess on garbage.
+        assert!(!super::token_is_locked("not-a-token"));
     }
 }
