@@ -394,6 +394,32 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Every quote currently in the given state. Boot-time value settlement
+    /// walks these: an `unpaid` quote the mint reports `PAID`/`ISSUED` for is
+    /// money this wallet has not taken yet.
+    pub fn quotes_in_state(&self, state: &str) -> Result<Vec<StoredQuote>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT quote_id, amount, unit, state, created_at, expires_at, request
+             FROM quotes WHERE state = ?1",
+        )?;
+        let rows = stmt.query_map(params![state], |r| {
+            Ok(StoredQuote {
+                quote_id: r.get(0)?,
+                amount: r.get::<_, i64>(1)? as u64,
+                unit: r.get(2)?,
+                state: r.get(3)?,
+                created_at: r.get::<_, i64>(4)? as u64,
+                expires_at: r.get::<_, i64>(5)? as u64,
+                request: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     // ---- payments journal (v2) ---------------------------------------------
     //
     // One row per payment, keyed by sha256(token). The phase column is the

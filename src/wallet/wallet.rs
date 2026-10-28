@@ -66,6 +66,47 @@ pub struct TollWallet {
     db_dir: PathBuf,
 }
 
+/// A `tokio::time::timeout` CANCELS the future it wraps — and cancelling a
+/// CDK saga mid-flight does not roll it back: the saga record persists in
+/// SQLite, half-executed. CDK itself only resumes such sagas when
+/// `recover_incomplete_sagas` runs, which this module did solely inside
+/// `ensure_mint` — i.e. at boot. A customer whose receive timed out at
+/// 14:00 therefore had their saga sit unfinished until the NEXT RESTART,
+/// and the HTTP layer answered "payment failed" for a payment whose swap
+/// the mint may well have accepted.
+///
+/// Called from every op's timeout arm: reconcile the cancelled saga
+/// in-session, detached, so the caller's error path stays fast. Budgeted at
+/// 120s; failures log and defer to the next boot's `ensure_mint` — the same
+/// ladder the Go origin runs (receive-intent reconcile on NUT-07 evidence).
+fn spawn_post_timeout_recovery(wallet: &Arc<Mutex<cdk::Wallet>>, mint: String) {
+    let wallet = wallet.clone();
+    tokio::spawn(async move {
+        let recovery = timeout(Duration::from_secs(120), async {
+            wallet.lock().await.recover_incomplete_sagas().await
+        })
+        .await;
+        match recovery {
+            Ok(Ok(report)) => {
+                if report.recovered > 0 || report.compensated > 0 {
+                    tracing::info!(
+                        mint = %mint,
+                        recovered = report.recovered,
+                        compensated = report.compensated,
+                        "post-timeout saga recovery settled a cancelled operation"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(mint = %mint, error = %e, "post-timeout saga recovery failed; retried at next boot")
+            }
+            Err(_) => {
+                tracing::warn!(mint = %mint, "post-timeout saga recovery timed out; retried at next boot")
+            }
+        }
+    });
+}
+
 impl TollWallet {
     /// Create a new TollWallet. Does NOT open any wallets — call `ensure_mint`.
     pub fn new(seed: [u8; 64], accepted_mints: Vec<String>, db_dir: PathBuf) -> Self {
@@ -176,7 +217,10 @@ impl TollWallet {
                 Ok(sat)
             }
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                spawn_post_timeout_recovery(&wallet, normalized.to_string());
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -211,7 +255,10 @@ impl TollWallet {
         match result {
             Ok(Ok(token_str)) => Ok(token_str),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                spawn_post_timeout_recovery(&wallet, normalized.to_string());
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -270,7 +317,10 @@ impl TollWallet {
                 expiry: quote.expiry,
             }),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                spawn_post_timeout_recovery(&wallet, normalized.to_string());
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -317,7 +367,10 @@ impl TollWallet {
         match result {
             Ok(Ok(quote)) => Ok(format!("{:?}", quote.state)),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                spawn_post_timeout_recovery(&wallet, normalized.to_string());
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -342,7 +395,10 @@ impl TollWallet {
         match result {
             Ok(Ok(total)) => Ok(total),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                spawn_post_timeout_recovery(&wallet, normalized.to_string());
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 
@@ -378,7 +434,10 @@ impl TollWallet {
                 fee: quote.fee_reserve.into(),
             }),
             Ok(Err(e)) => Err(WalletError::Cdk(e)),
-            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+            Err(_) => {
+                spawn_post_timeout_recovery(&wallet, normalized.to_string());
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
         }
     }
 

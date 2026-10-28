@@ -10,16 +10,21 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
-/// The mint a token came from, parsed without any network call.
-fn verifier_token_mint(token: &str) -> Result<String, String> {
+/// The mint and face value (sats) of a token, parsed without any network call.
+fn verifier_token_facts(token: &str) -> Result<(String, u64), String> {
     use cashu::nuts::Token;
     let t: Token = token
         .parse()
         .map_err(|e| format!("invalid Cashu token: {e}"))?;
     let url = t
         .mint_url()
-        .map_err(|e| format!("token has no mint URL: {e}"))?;
-    Ok(url.to_string().trim_end_matches('/').to_string())
+        .map_err(|e| format!("token has no mint URL: {e}"))?
+        .to_string();
+    let face_sat: u64 = t
+        .value()
+        .map_err(|e| format!("token has no spendable value: {e}"))?
+        .into();
+    Ok((url.trim_end_matches('/').to_string(), face_sat))
 }
 
 /// Extract a Cashu token from a Nostr kind 21000 event JSON body.
@@ -103,6 +108,34 @@ pub(crate) fn calculate_allotment(
     Ok(steps * step_size)
 }
 
+/// Fund-safety gate: a payment must buy at least the operator's minimum
+/// number of steps BEFORE the token is received.
+///
+/// In the order this gate replaced, `receive()` ran first and the below-
+/// minimum refusal came afterwards — the token was consumed with nothing
+/// granted and no refund path, so a below-minimum payment was confiscated by
+/// ordering. `min_purchase_steps` is floored to 1 (schema parity with the Go
+/// origin, which floors absent/0 to 1 for legacy configs), so every accepted
+/// payment buys at least one whole step.
+pub(crate) fn precheck_payment(
+    face_sat: u64,
+    price_per_step: u64,
+    min_purchase_steps: u64,
+) -> Result<(), String> {
+    let price_per_step = price_per_step.max(1);
+    let min_steps = min_purchase_steps.max(1);
+    let steps = face_sat / price_per_step;
+    if steps < min_steps {
+        // Message spelling matches the Go origin (merchant.go, the
+        // calculateAllotment minimum check) so portal/operator tooling greps
+        // identically on both modules.
+        return Err(format!(
+            "payment only covers {steps} steps, but minimum purchase is {min_steps} steps"
+        ));
+    }
+    Ok(())
+}
+
 /// Build the signed kind-1022 session event (TIP-01).
 ///
 /// `device_identifier` is the customer's MAC. `customer_pubkey` is `Some` only
@@ -132,6 +165,30 @@ pub(crate) fn build_session_event(
 
     let event = crate::nostr_event::create_event(1022, tags, "", &identity.secret_key);
     serde_json::to_value(&event).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// HTTP semantics for a failed receive. A timeout is an UNKNOWN outcome,
+/// not a rejection: `tokio::time::timeout` cancels the receive saga
+/// mid-flight, and a cancelled saga may or may not have been accepted by the
+/// mint — the wallet reconciles it in-session, but at answer time the honest
+/// status is 504 `payment-outcome-unknown` with do-not-resubmit guidance.
+/// Answering 402 "rejected" invites the customer to treat a possibly-spent
+/// token as failed and pay twice.
+fn receive_failure_shape(
+    e: &crate::wallet::wallet::WalletError,
+) -> (StatusCode, &'static str, String) {
+    match e {
+        crate::wallet::wallet::WalletError::Timeout(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "payment-outcome-unknown",
+            "payment outcome unknown after timeout; do not resubmit this token".to_string(),
+        ),
+        other => (
+            StatusCode::PAYMENT_REQUIRED,
+            "payment-processing-failed",
+            format!("payment rejected: wallet receive failed: {other}"),
+        ),
+    }
 }
 
 pub async fn handle_pay(
@@ -209,16 +266,38 @@ pub async fn handle_pay(
         );
     };
 
+    // NUT-10 spending conditions (P2PK/HTLC) lock the proofs to conditions
+    // this gateway cannot satisfy: receiving such a token takes value the
+    // wallet can never spend upstream. Refused at parse time — the cheapest
+    // check, before any network call or mint consultation.
+    if crate::wallet::verify::token_is_locked(&token) {
+        tracing::warn!("payment refused: token carries NUT-10 spending conditions");
+        let json = notice_json(
+            &state.identity,
+            "payment-error-invalid-token",
+            "payment rejected: token carries NUT-10 spending conditions (P2PK/HTLC) and cannot be received",
+        );
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
+
     // A6/A8: decide whether this token's mint is acceptable BEFORE any network
     // call. `verify()` performs a NUT-07 checkstate round trip, so checking the
     // allowlist afterwards meant a token from an unaccepted mint cost a full
     // mint timeout (30 s) before being refused — and a token whose mint was
     // simply unreachable hung the request. Cheap checks first.
-    let mint = match verifier_token_mint(&token).and_then(|m| {
+    let (mint, face_sat) = match verifier_token_facts(&token).and_then(|(m, v)| {
         crate::http::routes::select::select_mint_for_token(&state.config, &m)
+            .map(|mc| (mc, v))
             .map_err(|e| format!("{e:?}"))
     }) {
-        Ok(m) => m,
+        Ok((m, v)) => (m, v),
         Err(e) => {
             tracing::warn!(error = %e, "payment rejected before mint contact");
             let json = notice_json(
@@ -242,7 +321,9 @@ pub async fn handle_pay(
     // the frozen journal terms instead of failing on the spent token — the
     // customer who lost a 200 to a crash, a timeout or a flaky link gets
     // their access on the retry without paying twice. Runs before any
-    // network call: the answer is local.
+    // network call — and before the price gate: the frozen terms already
+    // priced this payment, so a later config change must not strand the
+    // delivery of something already bought.
     {
         let id = crate::payment_journal::token_id(&token);
         let settled = {
@@ -304,6 +385,32 @@ pub async fn handle_pay(
         }
     }
 
+    // Fund safety: a payment must buy at least the operator's minimum number
+    // of steps BEFORE the token is received. In the order this replaces,
+    // `receive()` ran first and the below-minimum refusal came afterwards —
+    // the token was consumed with nothing granted and no refund path, so a
+    // below-minimum payment was confiscated by ordering. Priced from the
+    // parsed face value: cheaper than the NUT-07 round trip it precedes
+    // (A6/A8 cheap-checks-first), and the mint's answer about proofs that can
+    // never buy one step is irrelevant. The post-receive `calculate_allotment`
+    // guard still prices the actual grant from the received amount.
+    if let Err(msg) = precheck_payment(face_sat, mint.price_per_step, mint.min_purchase_steps) {
+        tracing::warn!(
+            face_sat,
+            price_per_step = mint.price_per_step,
+            "payment below minimum refused before mint contact"
+        );
+        let json = notice_json(&state.identity, "payment-error-below-minimum", &msg);
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
+
     // A3: the client's identity, resolved from the connection's address.
     //
     // Pre-A3 this was the literal `00:00:00:00:00:00`, which meant `/usage`
@@ -313,8 +420,10 @@ pub async fn handle_pay(
     // deployments); the header path remains only for `identity_from_socket = false`.
     //
     // Fund safety: resolution runs BEFORE `receive()` — the payment journal
-    // records the buyer at intent time, and an unresolvable client must be
-    // refused before value moves.
+    // records the buyer at intent time, an unresolvable client must be
+    // refused before value moves, and a 400 after consumption would strand
+    // the token for a session nobody could ever look up. The Go origin
+    // refuses unidentified clients pre-receive too (`client-not-registered`).
     let (device_opt, _extra) =
         crate::http::mac::resolve_client(Some(peer), &headers, state.config.identity_from_socket);
     let device_identifier = match device_opt {
@@ -433,22 +542,19 @@ pub async fn handle_pay(
                 {
                     let sessions = state.sessions.lock().await;
                     if let Some(store) = sessions.store() {
-                        let phase = if matches!(e, crate::wallet::wallet::WalletError::Timeout(_)) {
-                            crate::payment_journal::PHASE_TIMEOUT_UNKNOWN
-                        } else {
-                            crate::payment_journal::PHASE_REJECTED
-                        };
+                        let phase =
+                            if matches!(e, crate::wallet::wallet::WalletError::Timeout(_)) {
+                                crate::payment_journal::PHASE_TIMEOUT_UNKNOWN
+                            } else {
+                                crate::payment_journal::PHASE_REJECTED
+                            };
                         let rec = payment_rec(phase, 0);
                         let _ = store.upsert_payment(&rec);
                     }
                 }
-                let json = notice_json(
-                    &state.identity,
-                    "payment-processing-failed",
-                    &format!("payment rejected: wallet receive failed: {e}"),
-                );
-                return (
-                    StatusCode::PAYMENT_REQUIRED,
+                let (status, code, message) = receive_failure_shape(&e);
+                let json = notice_json(&state.identity, code, &message);                return (
+                    status,
                     [
                         ("content-type", "application/json"),
                         ("access-control-allow-origin", "*"),
@@ -503,11 +609,17 @@ pub async fn handle_pay(
     ) {
         Ok(a) if a > 0 => a,
         Ok(_) => {
+            // With the pre-receive gate above, this branch is reachable only
+            // when swap fees consumed the margin between the token's face
+            // value and what the wallet actually received. Value has already
+            // moved; the honest classification is the fee class — the old
+            // `payment-error-token-spent` code told the customer their note
+            // was dead when it had in fact been taken as payment.
             let json = notice_json(
                 &state.identity,
-                "payment-error-token-spent",
+                "payment-error-below-swap-fee",
                 &format!(
-                    "payment of {received_amount} sat does not cover one step at {} sat/step",
+                    "payment of {received_amount} sat does not cover one step at {} sat/step after swap fees",
                     mint.price_per_step
                 ),
             );
@@ -582,6 +694,35 @@ pub async fn handle_pay(
         );
     }
     drop(sessions);
+
+    // `create_session` answers the `{allotment: 0, expiry: 0}` sentinel exactly
+    // when the durable store refused the write — it also removes the session
+    // from memory ("a session we could not persist is a session we do not
+    // have"). The pre-receive gate guarantees `allotment > 0` for every grant
+    // that reaches this point, so a zero here is always the persist-failure
+    // sentinel, never a real allotment. Advertising 200 would claim access
+    // that vanishes on restart; the payment's value is already in the wallet,
+    // so the customer must be told to seek the operator, not to pay again.
+    if session.allotment == 0 {
+        tracing::error!(
+            mac = %device_identifier,
+            received_sat = received_amount,
+            "session persist failed after receive; refusing to advertise a grant"
+        );
+        let json = notice_json(
+            &state.identity,
+            "session-error",
+            "payment received but the session could not be recorded; do not pay again — contact the operator with this response",
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
 
     tracing::info!(
         verified_msat = verified_amount,
@@ -694,5 +835,25 @@ mod tests {
         // We verify the status code constant matches.
         let expected = StatusCode::PAYMENT_REQUIRED;
         assert_eq!(expected.as_u16(), 402);
+    }
+
+    /// A receive timeout is an UNKNOWN outcome: 504 + do-not-resubmit, never
+    /// a 402 that invites the customer to spend a second token.
+    #[test]
+    fn receive_timeout_maps_to_outcome_unknown_not_rejected() {
+        let e = crate::wallet::wallet::WalletError::Timeout(std::time::Duration::from_secs(30));
+        let (status, code, message) = receive_failure_shape(&e);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "payment-outcome-unknown");
+        assert!(message.contains("do not resubmit"), "got: {message}");
+    }
+
+    /// Definitive receive failures keep the rejection semantics.
+    #[test]
+    fn definitive_receive_failure_stays_a_rejection() {
+        let e = crate::wallet::wallet::WalletError::TokenParse("bad token".into());
+        let (status, code, _) = receive_failure_shape(&e);
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(code, "payment-processing-failed");
     }
 }

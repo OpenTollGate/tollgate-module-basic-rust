@@ -236,6 +236,29 @@ pub async fn handle_create_ln_invoice(
         .map(|mut r| r.insert(&quote.id, req.amount, expiry))
         .ok();
 
+    // Durable quote record: the registry is process memory, so before this a
+    // restart forgot every quote — a customer who had PAID an invoice polled
+    // into a 404 with the sats stranded at the mint (ADR-0001 names exactly
+    // this loss). The store row is the recovery source; the registry stays a
+    // cache. Persist the invoice string too: it is the quote's identity for
+    // an operator reconciling by BOLT11.
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(store) = sessions.store() {
+            if let Err(e) = store.upsert_quote(
+                &quote.id,
+                req.amount,
+                "sat",
+                "unpaid",
+                now,
+                expiry,
+                &quote.request,
+            ) {
+                tracing::error!(quote = %quote.id, error = %e, "durable quote write failed");
+            }
+        }
+    }
+
     let body = InvoiceResponse {
         status: 1,
         quote: quote.id,
@@ -274,10 +297,48 @@ pub async fn handle_get_ln_invoice(
     headers: axum::http::HeaderMap,
     Query(q): Query<InvoiceQuery>,
 ) -> impl IntoResponse {
-    let found = registry(&state)
+    // Registry (process cache) first; on a miss, the durable store. After a
+    // restart the registry is empty by construction, so without this fallback
+    // every pre-restart quote answered 404 — including quotes the customer
+    // had already paid. Rehydrated quotes carry their persisted state, so an
+    // `issued` quote can never re-grant.
+    let mut found = registry(&state)
         .lock()
         .ok()
         .and_then(|r| r.get(&q.quote).cloned());
+    if found.is_none() {
+        let sessions = state.sessions.lock().await;
+        if let Some(stored) = sessions
+            .store()
+            .and_then(|st| st.get_quote(&q.quote).ok().flatten())
+        {
+            let persisted_state = match stored.state.as_str() {
+                "issued" => QuoteState::Issued,
+                "paid" => QuoteState::Paid,
+                _ => QuoteState::Unpaid,
+            };
+            let rehydrated = crate::http::routes::quote::MintQuote {
+                id: stored.quote_id.clone(),
+                amount: stored.amount,
+                expiry: stored.expires_at,
+                state: persisted_state,
+                payment_id: None,
+            };
+            drop(sessions);
+            registry(&state)
+                .lock()
+                .map(|mut r| {
+                    r.insert_existing(
+                        &rehydrated.id,
+                        rehydrated.amount,
+                        rehydrated.expiry,
+                        persisted_state,
+                    )
+                })
+                .ok();
+            found = Some(rehydrated);
+        }
+    }
 
     // Corpus `get-unknown-quote-fullservice`: 404 with the error envelope.
     let Some(quote) = found else {
@@ -503,6 +564,18 @@ pub async fn handle_get_ln_invoice(
         .lock()
         .map(|mut r| r.mark_issued(&quote.id))
         .ok();
+
+    // Durable too: the registry mark dies with the process, and a restarted
+    // instance must never treat an already-granted quote as grantable again —
+    // rehydrating from the store only prevents that if the mark was persisted.
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(store) = sessions.store() {
+            if let Err(e) = store.set_quote_state(&quote.id, "issued") {
+                tracing::error!(quote = %quote.id, error = %e, "durable issued-mark write failed");
+            }
+        }
+    }
 
     let body = PaidStatus {
         status: 1,

@@ -15,6 +15,8 @@ mod pay_journal_test;
 #[cfg(test)]
 mod pay_notice_test;
 #[cfg(test)]
+mod pay_precheck_test;
+#[cfg(test)]
 mod pay_session_test;
 pub mod quote;
 pub mod select;
@@ -33,6 +35,8 @@ mod balance_contract_test;
 mod ln_invoice_identity_test;
 
 pub mod identity;
+#[cfg(test)]
+mod ln_quote_recovery_test;
 #[cfg(test)]
 mod purchase_path_test;
 pub mod session_state;
