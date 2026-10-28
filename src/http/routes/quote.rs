@@ -87,6 +87,21 @@ impl MintQuoteRegistry {
         );
     }
 
+    /// Rehydrate a quote that already has a state — the durable store's
+    /// word at boot, not a fresh creation.
+    pub fn insert_existing(&mut self, id: &str, amount: u64, expiry: u64, state: QuoteState) {
+        self.quotes.insert(
+            id.to_string(),
+            MintQuote {
+                id: id.to_string(),
+                amount,
+                expiry,
+                state,
+                payment_id: None,
+            },
+        );
+    }
+
     pub fn get(&self, id: &str) -> Option<&MintQuote> {
         self.quotes.get(id)
     }
