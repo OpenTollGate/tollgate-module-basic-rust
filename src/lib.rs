@@ -7,6 +7,7 @@ pub mod identity;
 pub mod identity_derive;
 pub mod metering;
 pub mod nostr_event;
+pub mod payment_journal;
 pub mod session;
 pub mod session_ticket;
 pub mod tracing_setup;

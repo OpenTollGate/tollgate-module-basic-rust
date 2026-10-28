@@ -316,6 +316,75 @@ pub async fn handle_pay(
         }
     };
 
+    // Settled-payment replay: a token this module has already banked (live
+    // `received` or reconciled `reconcile-spent`) re-grants the session from
+    // the frozen journal terms instead of failing on the spent token — the
+    // customer who lost a 200 to a crash, a timeout or a flaky link gets
+    // their access on the retry without paying twice. Runs before any
+    // network call — and before the price gate: the frozen terms already
+    // priced this payment, so a later config change must not strand the
+    // delivery of something already bought.
+    {
+        let id = crate::payment_journal::token_id(&token);
+        let settled = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .store()
+                .and_then(|st| st.get_payment(&id).ok().flatten())
+                .filter(|rec| crate::payment_journal::is_settled(&rec.phase))
+        };
+        if let Some(rec) = settled {
+            let allotment = crate::payment_journal::allotment_for(&rec);
+            let start_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.create_session(
+                &rec.mac,
+                allotment,
+                &rec.metric,
+                // Exhaustion-driven, like the original grant: the frozen
+                // terms priced this access once already.
+                u64::MAX / 4,
+            );
+            drop(sessions);
+            if session.allotment == 0 {
+                let json = notice_json(
+                    &state.identity,
+                    "session-error",
+                    "payment already received but the session could not be recorded; do not pay again — contact the operator with this response",
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [
+                        ("content-type", "application/json"),
+                        ("access-control-allow-origin", "*"),
+                    ],
+                    json,
+                );
+            }
+            let _ = crate::metering::open_gate(&rec.mac).await;
+            let resp = build_session_event(
+                &state.config,
+                &state.identity,
+                &rec.mac,
+                allotment,
+                start_time,
+                None,
+            );
+            let json = serde_json::to_string(&resp).unwrap_or_default();
+            return (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/json"),
+                    ("access-control-allow-origin", "*"),
+                ],
+                json,
+            );
+        }
+    }
+
     // Fund safety: a payment must buy at least the operator's minimum number
     // of steps BEFORE the token is received. In the order this replaces,
     // `receive()` ran first and the below-minimum refusal came afterwards —
@@ -350,11 +419,11 @@ pub async fn handle_pay(
     // ADR-0007 §1: identity is the TCP peer (config-gated escape hatch for proxied
     // deployments); the header path remains only for `identity_from_socket = false`.
     //
-    // Fund safety: resolution runs BEFORE `receive()`. In the order this
-    // replaces, an unresolvable client was answered 400 only after the token
-    // had been consumed — value moved for a session nobody could ever look up.
-    // The Go origin refuses unidentified clients before value moves too
-    // (`client-not-registered`, merchant.go), so this is also wire-correct.
+    // Fund safety: resolution runs BEFORE `receive()` — the payment journal
+    // records the buyer at intent time, an unresolvable client must be
+    // refused before value moves, and a 400 after consumption would strand
+    // the token for a session nobody could ever look up. The Go origin
+    // refuses unidentified clients pre-receive too (`client-not-registered`).
     let (device_opt, _extra) =
         crate::http::mac::resolve_client(Some(peer), &headers, state.config.identity_from_socket);
     let device_identifier = match device_opt {
@@ -406,6 +475,54 @@ pub async fn handle_pay(
         }
     };
 
+    // Payment journal, part 1: the frozen record. Pricing terms are captured
+    // at intent time so a later reconcile grants what was paid for even if
+    // the operator changes config before the deciding boot.
+    let payment_id = crate::payment_journal::token_id(&token);
+    let payment_rec = |phase: &str, amount_sat: u64| crate::session::store::PaymentRecord {
+        id: payment_id.clone(),
+        token: token.clone(),
+        mac: device_identifier.clone(),
+        mint: mint.url.clone(),
+        amount_sat,
+        price_per_step: mint.price_per_step,
+        step_size: state.config.step_size,
+        metric: state.config.metric.clone(),
+        phase: phase.to_string(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    // Payment journal, part 2: the intent row exists BEFORE value moves. A
+    // crash anywhere between `receive()` and the 200 leaves this row for the
+    // boot reconciler (NUT-07 decides: spent ⇒ the owed session is granted).
+    // A payment whose intent cannot be journaled is refused outright — moving
+    // value with no recovery record is exactly the window this table closes.
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(store) = sessions.store() {
+            let rec = payment_rec(crate::payment_journal::PHASE_INTENT, verified_amount / 1000);
+            if let Err(e) = store.upsert_payment(&rec) {
+                tracing::error!(error = %e, "payment journal intent write failed; refusing to move value");
+                let json = notice_json(
+                    &state.identity,
+                    "payment-processing-failed",
+                    "payment refused: the payment journal is unavailable",
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [
+                        ("content-type", "application/json"),
+                        ("access-control-allow-origin", "*"),
+                    ],
+                    json,
+                );
+            }
+        }
+    }
+
     // Step 2: receive token into wallet
     let wallet_guard = state.wallet.lock().await;
     let received_amount = if let Some(ref wallet) = *wallet_guard {
@@ -417,9 +534,26 @@ pub async fn handle_pay(
             Err(e) => {
                 tracing::warn!(error = %e, "wallet receive failed");
                 drop(wallet_guard);
+                // Journal the outcome class before answering: a definitive
+                // failure owes nothing (`rejected`); a timeout is UNKNOWN
+                // (`timeout-unknown`) — the cancelled saga may still have
+                // been accepted by the mint, and the boot reconciler decides
+                // it on NUT-07 evidence rather than on this refusal.
+                {
+                    let sessions = state.sessions.lock().await;
+                    if let Some(store) = sessions.store() {
+                        let phase =
+                            if matches!(e, crate::wallet::wallet::WalletError::Timeout(_)) {
+                                crate::payment_journal::PHASE_TIMEOUT_UNKNOWN
+                            } else {
+                                crate::payment_journal::PHASE_REJECTED
+                            };
+                        let rec = payment_rec(phase, 0);
+                        let _ = store.upsert_payment(&rec);
+                    }
+                }
                 let (status, code, message) = receive_failure_shape(&e);
-                let json = notice_json(&state.identity, code, &message);
-                return (
+                let json = notice_json(&state.identity, code, &message);                return (
                     status,
                     [
                         ("content-type", "application/json"),
@@ -447,6 +581,19 @@ pub async fn handle_pay(
         );
     };
     drop(wallet_guard);
+
+    // Journal the live outcome: value has moved, so the row advances to
+    // `received` before the session work below — a crash from here on is
+    // covered by this terminal (idempotent same-MAC overwrite at replay).
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(store) = sessions.store() {
+            let rec = payment_rec(crate::payment_journal::PHASE_RECEIVED, received_amount);
+            if let Err(e) = store.upsert_payment(&rec) {
+                tracing::error!(error = %e, "payment journal terminal write failed; boot reconcile will decide the row");
+            }
+        }
+    }
 
     // Step 3: create session.
     //
@@ -514,6 +661,38 @@ pub async fn handle_pay(
         &state.config.metric,
         start_time,
     );
+    if session.allotment == 0 {
+        // The persist-failure sentinel: value moved, but the session is NOT
+        // durable (create_session removed it from memory and answers
+        // {allotment: 0} — the pre-receive gate guarantees every real grant
+        // a positive allotment). Roll the journal row back to `intent` so
+        // the boot reconciler re-grants — and keeps re-granting — until a
+        // session row sticks, then refuse: a 200 here would promise access
+        // that vanishes on restart.
+        if let Some(store) = sessions.store() {
+            let rec = payment_rec(crate::payment_journal::PHASE_INTENT, received_amount);
+            let _ = store.upsert_payment(&rec);
+        }
+        drop(sessions);
+        tracing::error!(
+            mac = %device_identifier,
+            received_sat = received_amount,
+            "session persist failed after receive; journal rolled back to intent for reconciliation"
+        );
+        let json = notice_json(
+            &state.identity,
+            "session-error",
+            "payment received but the session could not be recorded; do not pay again — it will be granted automatically",
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
     drop(sessions);
 
     // `create_session` answers the `{allotment: 0, expiry: 0}` sentinel exactly
