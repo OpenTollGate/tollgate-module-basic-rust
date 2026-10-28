@@ -286,9 +286,16 @@ mod tests {
         ))));
         // P1: durable. Same fail-closed rule as main.rs — an unreadable store
         // must not be read as "no sessions".
-        let state_db = std::env::var("TOLLGATE_STATE_DB")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/etc/tollgate/tollgate.db"));
+        //
+        // Hermetic by derivation: the state db follows `config_dir()`, which
+        // INIT has already redirected to the test temp dir above. The former
+        // hardcoded fallback (`/etc/tollgate/tollgate.db`) made the test
+        // binary open — and fail-closed `exit(78)` on, and even migrate —
+        // the HOST's real state on any machine that has one, coupling test
+        // success to machine history. `TOLLGATE_STATE_DB` is deliberately
+        // not consulted here: a stray environment variable must not point
+        // tests at operator state either.
+        let state_db = crate::config::config_dir().join("tollgate.db");
         let sessions = Arc::new(tokio::sync::Mutex::new(
             SessionManager::open(&state_db).unwrap_or_else(|e| {
                 eprintln!(
