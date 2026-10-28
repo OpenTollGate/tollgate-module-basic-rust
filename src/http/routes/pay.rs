@@ -10,16 +10,21 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
-/// The mint a token came from, parsed without any network call.
-fn verifier_token_mint(token: &str) -> Result<String, String> {
+/// The mint and face value (sats) of a token, parsed without any network call.
+fn verifier_token_facts(token: &str) -> Result<(String, u64), String> {
     use cashu::nuts::Token;
     let t: Token = token
         .parse()
         .map_err(|e| format!("invalid Cashu token: {e}"))?;
     let url = t
         .mint_url()
-        .map_err(|e| format!("token has no mint URL: {e}"))?;
-    Ok(url.to_string().trim_end_matches('/').to_string())
+        .map_err(|e| format!("token has no mint URL: {e}"))?
+        .to_string();
+    let face_sat: u64 = t
+        .value()
+        .map_err(|e| format!("token has no spendable value: {e}"))?
+        .into();
+    Ok((url.trim_end_matches('/').to_string(), face_sat))
 }
 
 /// Extract a Cashu token from a Nostr kind 21000 event JSON body.
@@ -101,6 +106,34 @@ pub(crate) fn calculate_allotment(
     }
     let steps = amount_sats / price_per_step;
     Ok(steps * step_size)
+}
+
+/// Fund-safety gate: a payment must buy at least the operator's minimum
+/// number of steps BEFORE the token is received.
+///
+/// In the order this gate replaced, `receive()` ran first and the below-
+/// minimum refusal came afterwards — the token was consumed with nothing
+/// granted and no refund path, so a below-minimum payment was confiscated by
+/// ordering. `min_purchase_steps` is floored to 1 (schema parity with the Go
+/// origin, which floors absent/0 to 1 for legacy configs), so every accepted
+/// payment buys at least one whole step.
+pub(crate) fn precheck_payment(
+    face_sat: u64,
+    price_per_step: u64,
+    min_purchase_steps: u64,
+) -> Result<(), String> {
+    let price_per_step = price_per_step.max(1);
+    let min_steps = min_purchase_steps.max(1);
+    let steps = face_sat / price_per_step;
+    if steps < min_steps {
+        // Message spelling matches the Go origin (merchant.go, the
+        // calculateAllotment minimum check) so portal/operator tooling greps
+        // identically on both modules.
+        return Err(format!(
+            "payment only covers {steps} steps, but minimum purchase is {min_steps} steps"
+        ));
+    }
+    Ok(())
 }
 
 /// Build the signed kind-1022 session event (TIP-01).
@@ -235,11 +268,12 @@ pub async fn handle_pay(
     // allowlist afterwards meant a token from an unaccepted mint cost a full
     // mint timeout (30 s) before being refused — and a token whose mint was
     // simply unreachable hung the request. Cheap checks first.
-    let mint = match verifier_token_mint(&token).and_then(|m| {
+    let (mint, face_sat) = match verifier_token_facts(&token).and_then(|(m, v)| {
         crate::http::routes::select::select_mint_for_token(&state.config, &m)
+            .map(|mc| (mc, v))
             .map_err(|e| format!("{e:?}"))
     }) {
-        Ok(m) => m,
+        Ok((m, v)) => (m, v),
         Err(e) => {
             tracing::warn!(error = %e, "payment rejected before mint contact");
             let json = notice_json(
@@ -249,6 +283,67 @@ pub async fn handle_pay(
             );
             return (
                 StatusCode::PAYMENT_REQUIRED,
+                [
+                    ("content-type", "application/json"),
+                    ("access-control-allow-origin", "*"),
+                ],
+                json,
+            );
+        }
+    };
+
+    // Fund safety: a payment must buy at least the operator's minimum number
+    // of steps BEFORE the token is received. In the order this replaces,
+    // `receive()` ran first and the below-minimum refusal came afterwards —
+    // the token was consumed with nothing granted and no refund path, so a
+    // below-minimum payment was confiscated by ordering. Priced from the
+    // parsed face value: cheaper than the NUT-07 round trip it precedes
+    // (A6/A8 cheap-checks-first), and the mint's answer about proofs that can
+    // never buy one step is irrelevant. The post-receive `calculate_allotment`
+    // guard still prices the actual grant from the received amount.
+    if let Err(msg) = precheck_payment(face_sat, mint.price_per_step, mint.min_purchase_steps) {
+        tracing::warn!(
+            face_sat,
+            price_per_step = mint.price_per_step,
+            "payment below minimum refused before mint contact"
+        );
+        let json = notice_json(&state.identity, "payment-error-below-minimum", &msg);
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
+
+    // A3: the client's identity, resolved from the connection's address.
+    //
+    // Pre-A3 this was the literal `00:00:00:00:00:00`, which meant `/usage`
+    // could never match a session and metering silently did nothing. A resolution
+    // failure is now refused explicitly rather than papered over with a sentinel.
+    // ADR-0007 §1: identity is the TCP peer (config-gated escape hatch for proxied
+    // deployments); the header path remains only for `identity_from_socket = false`.
+    //
+    // Fund safety: resolution runs BEFORE `receive()`. In the order this
+    // replaces, an unresolvable client was answered 400 only after the token
+    // had been consumed — value moved for a session nobody could ever look up.
+    // The Go origin refuses unidentified clients before value moves too
+    // (`client-not-registered`, merchant.go), so this is also wire-correct.
+    let (device_opt, _extra) =
+        crate::http::mac::resolve_client(Some(peer), &headers, state.config.identity_from_socket);
+    let device_identifier = match device_opt {
+        Some(resolved) => resolved,
+        None => {
+            tracing::warn!("payment refused: could not resolve the client device identity");
+            let json = notice_json(
+                &state.identity,
+                "session-error",
+                "could not resolve the client device identity from DHCP leases or ARP",
+            );
+            return (
+                StatusCode::BAD_REQUEST,
                 [
                     ("content-type", "application/json"),
                     ("access-control-allow-origin", "*"),
@@ -332,35 +427,6 @@ pub async fn handle_pay(
     };
     drop(wallet_guard);
 
-    // A3: the client's identity, resolved from the connection's address.
-    //
-    // Pre-A3 this was the literal `00:00:00:00:00:00`, which meant `/usage`
-    // could never match a session and metering silently did nothing. A resolution
-    // failure is now refused explicitly rather than papered over with a sentinel.
-    // ADR-0007 §1: identity is the TCP peer (config-gated escape hatch for proxied
-    // deployments); the header path remains only for `identity_from_socket = false`.
-    let (device_opt, _extra) =
-        crate::http::mac::resolve_client(Some(peer), &headers, state.config.identity_from_socket);
-    let device_identifier = match device_opt {
-        Some(resolved) => resolved,
-        None => {
-            tracing::warn!("payment refused: could not resolve the client device identity");
-            let json = notice_json(
-                &state.identity,
-                "session-error",
-                "could not resolve the client device identity from DHCP leases or ARP",
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                [
-                    ("content-type", "application/json"),
-                    ("access-control-allow-origin", "*"),
-                ],
-                json,
-            );
-        }
-    };
-
     // Step 3: create session.
     //
     // A1: allotment comes from the PRICE TABLE (steps x step_size), not from a
@@ -375,11 +441,17 @@ pub async fn handle_pay(
     ) {
         Ok(a) if a > 0 => a,
         Ok(_) => {
+            // With the pre-receive gate above, this branch is reachable only
+            // when swap fees consumed the margin between the token's face
+            // value and what the wallet actually received. Value has already
+            // moved; the honest classification is the fee class — the old
+            // `payment-error-token-spent` code told the customer their note
+            // was dead when it had in fact been taken as payment.
             let json = notice_json(
                 &state.identity,
-                "payment-error-token-spent",
+                "payment-error-below-swap-fee",
                 &format!(
-                    "payment of {received_amount} sat does not cover one step at {} sat/step",
+                    "payment of {received_amount} sat does not cover one step at {} sat/step after swap fees",
                     mint.price_per_step
                 ),
             );
@@ -415,13 +487,42 @@ pub async fn handle_pay(
         .as_secs();
 
     let mut sessions = state.sessions.lock().await;
-    let _session = sessions.create_session(
+    let session = sessions.create_session(
         &device_identifier,
         allotment,
         &state.config.metric,
         start_time,
     );
     drop(sessions);
+
+    // `create_session` answers the `{allotment: 0, expiry: 0}` sentinel exactly
+    // when the durable store refused the write — it also removes the session
+    // from memory ("a session we could not persist is a session we do not
+    // have"). The pre-receive gate guarantees `allotment > 0` for every grant
+    // that reaches this point, so a zero here is always the persist-failure
+    // sentinel, never a real allotment. Advertising 200 would claim access
+    // that vanishes on restart; the payment's value is already in the wallet,
+    // so the customer must be told to seek the operator, not to pay again.
+    if session.allotment == 0 {
+        tracing::error!(
+            mac = %device_identifier,
+            received_sat = received_amount,
+            "session persist failed after receive; refusing to advertise a grant"
+        );
+        let json = notice_json(
+            &state.identity,
+            "session-error",
+            "payment received but the session could not be recorded; do not pay again — contact the operator with this response",
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
 
     tracing::info!(
         verified_msat = verified_amount,

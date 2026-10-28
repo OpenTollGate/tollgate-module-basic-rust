@@ -13,6 +13,8 @@ mod pay_body_test;
 #[cfg(test)]
 mod pay_notice_test;
 #[cfg(test)]
+mod pay_precheck_test;
+#[cfg(test)]
 mod pay_session_test;
 pub mod quote;
 pub mod select;
