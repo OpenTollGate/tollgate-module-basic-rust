@@ -185,6 +185,80 @@ async fn main() {
         }
     }
 
+    // Value settlement at boot: an `unpaid` quote the mint reports PAID or
+    // ISSUED for is money this wallet has not taken yet. Before durable
+    // quotes existed, every pre-restart quote was forgotten on restart — a
+    // paid invoice's sats stayed at the mint with the quote id lost. The
+    // store row is durable now, so walk the outstanding ones and mint the
+    // value into the wallet. No session is granted here: the store schema
+    // records no MAC for a quote, so the customer's session is granted by
+    // their next poll (which sees `issued` and grants without re-minting).
+    // Single-mint deployments only (`default_mint`): the quotes table carries
+    // no mint column — multi-mint settlement lands with that schema work.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let candidates: Vec<_> = {
+            let sessions = state.sessions.lock().await;
+            match sessions.store() {
+                Some(st) => st
+                    .quotes_in_state("unpaid")
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "boot settle: store read failed");
+                        Vec::new()
+                    })
+                    .into_iter()
+                    .filter(|q| q.expires_at > now)
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        if !candidates.is_empty() {
+            tracing::info!(
+                count = candidates.len(),
+                "boot settle: checking outstanding quotes"
+            );
+            let mut minted: Vec<(String, u64)> = Vec::new();
+            {
+                let wallet = state.wallet.lock().await;
+                if let (Some(w), Some(mint)) = (
+                    wallet.as_ref(),
+                    wallet.as_ref().and_then(|w| w.default_mint()),
+                ) {
+                    for q in &candidates {
+                        let mint_word = match w.check_mint_quote(&mint, &q.quote_id).await {
+                            Ok(s) => s.to_uppercase(),
+                            Err(e) => {
+                                tracing::warn!(quote = %q.quote_id, error = %e, "boot settle: mint check failed; retried next boot");
+                                continue;
+                            }
+                        };
+                        if !(mint_word.contains("PAID") || mint_word.contains("ISSUED")) {
+                            continue;
+                        }
+                        match w.mint_tokens(&mint, &q.quote_id).await {
+                            Ok(sats) => minted.push((q.quote_id.clone(), sats)),
+                            Err(e) => {
+                                tracing::warn!(quote = %q.quote_id, error = %e, "boot settle: mint failed; retried next boot")
+                            }
+                        }
+                    }
+                }
+            }
+            for (quote_id, sats) in &minted {
+                let sessions = state.sessions.lock().await;
+                if let Some(st) = sessions.store() {
+                    if let Err(e) = st.set_quote_state(quote_id, "issued") {
+                        tracing::error!(quote = %quote_id, error = %e, "boot settle: state write failed; quote may re-mint idempotently next boot");
+                    }
+                }
+                tracing::info!(quote = %quote_id, sats, "boot settle: minted a paid quote left behind by a restart");
+            }
+        }
+    }
+
     // ADR-0006 §1/§3/§4: periodic gate-close sweep. Before this, close_expired ran
     // ONLY at startup, so a session could expire or exhaust while the daemon ran and
     // the client kept the access it paid for. The sweep closes terminal sessions and

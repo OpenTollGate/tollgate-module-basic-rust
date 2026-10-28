@@ -34,6 +34,8 @@ mod ln_invoice_identity_test;
 
 pub mod identity;
 #[cfg(test)]
+mod ln_quote_recovery_test;
+#[cfg(test)]
 mod purchase_path_test;
 pub mod session_state;
 pub mod session_ticket_route;
