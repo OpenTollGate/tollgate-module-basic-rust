@@ -1,7 +1,10 @@
 # Files to preserve across sysupgrade. Each line is a path prefix
 # that the OpenWrt sysupgrade tool keeps intact.
-/etc/tollgate/config.json
-/etc/tollgate/identities.json
-/etc/tollgate/wallet_seed.bin
-/etc/tollgate/install.json
-/etc/tollgate/ecash/
+#
+# The whole state directory: alongside config.json/identities.json it holds
+# tollgate.db (durable sessions + quotes), the per-mint wallet *.sqlite
+# files (proofs — losing them is silent balance loss, there is no seed-only
+# restore), their WAL/SHM sidecars, wallet_seed.bin and the migration
+# tokens.jsonl. The per-mint wallet filenames are derived from mint URLs, so
+# they cannot be enumerated here — only the directory prefix covers them.
+/etc/tollgate
