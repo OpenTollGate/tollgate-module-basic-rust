@@ -111,6 +111,70 @@ impl TokenVerifier {
             .map_err(|e| format!("token has no mint URL: {e}"))?;
         Ok(mint_url.to_string().trim_end_matches('/').to_string())
     }
+
+    /// NUT-07 spent-check for payment reconciliation — not a payment gate.
+    ///
+    /// Unlike `verify`, this IGNORES the accepted-mint list: a payment
+    /// journaled yesterday must stay decidable today even if the operator has
+    /// since removed the mint from the config. Returns `Ok(Some(spent_sat))`
+    /// when every proof is SPENT (the customer paid), `Ok(None)` when any
+    /// proof is still UNSPENT (nothing was taken), and `Err` when the mint
+    /// could not be asked or a proof is PENDING — the caller treats `Err` as
+    /// "undecided, retry next boot", never as a refusal: guessing either way
+    /// either strands a paying customer or grants a free session.
+    pub async fn check_state(&self, token_str: &str) -> Result<Option<u64>, String> {
+        let token: Token = token_str
+            .parse()
+            .map_err(|e| format!("invalid Cashu token: {e}"))?;
+        let mint_url = token
+            .mint_url()
+            .map_err(|e| format!("token has no mint URL: {e}"))?
+            .to_string();
+        let mint_base = mint_url.trim_end_matches('/').to_string();
+        let face_sat: u64 = token
+            .value()
+            .map_err(|e| format!("could not sum token value: {e}"))?
+            .into();
+        let ys = token_proof_ys(&token);
+        if ys.is_empty() {
+            return Err("token contains no proofs".to_string());
+        }
+
+        let url = format!("{mint_base}/v1/checkstate");
+        let body = serde_json::json!({ "Ys": ys });
+        let resp: serde_json::Value = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("mint check-state request failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("mint returned error: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("mint response not JSON: {e}"))?;
+        let states = resp["states"]
+            .as_array()
+            .ok_or("mint response missing 'states'")?;
+        if states.is_empty() {
+            return Err("mint reported no states".to_string());
+        }
+
+        let mut any_unspent = false;
+        for state in states {
+            match state["state"].as_str().unwrap_or("") {
+                "SPENT" => {}
+                "UNSPENT" => any_unspent = true,
+                other => return Err(format!("proof state {other:?}: outcome still unknown")),
+            }
+        }
+        if any_unspent {
+            Ok(None)
+        } else {
+            Ok(Some(face_sat))
+        }
+    }
 }
 
 /// Extract Y-values (compressed blinded pubkey hex) from token proofs.

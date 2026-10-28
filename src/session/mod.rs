@@ -416,6 +416,9 @@ impl Default for SessionManager {
 }
 
 #[cfg(test)]
+mod store_payments_test;
+
+#[cfg(test)]
 mod store_test;
 
 #[cfg(test)]

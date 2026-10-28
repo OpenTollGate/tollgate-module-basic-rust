@@ -11,6 +11,8 @@ pub mod pay;
 #[cfg(test)]
 mod pay_body_test;
 #[cfg(test)]
+mod pay_journal_test;
+#[cfg(test)]
 mod pay_notice_test;
 #[cfg(test)]
 mod pay_session_test;

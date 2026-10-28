@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::CustomerSession;
 
 /// Current on-disk schema. Bump when the layout changes, and add a migration.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -77,6 +77,26 @@ pub struct StoredQuote {
     pub request: String,
 }
 
+/// One journaled payment (v2). Pricing terms are frozen at intent time so
+/// reconciliation grants what was paid for even if the operator changes
+/// config before the boot that decides an undecided row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentRecord {
+    /// sha256(token) — audit/grep key; the raw token rides along because the
+    /// mint must be asked about inputs that may never have reached the
+    /// wallet's own database.
+    pub id: String,
+    pub token: String,
+    pub mac: String,
+    pub mint: String,
+    pub amount_sat: u64,
+    pub price_per_step: u64,
+    pub step_size: u64,
+    pub metric: String,
+    pub phase: String,
+    pub ts: u64,
+}
+
 /// The durable store. Owns one connection; the manager wraps this.
 pub struct SessionStore {
     conn: Connection,
@@ -121,6 +141,10 @@ impl SessionStore {
         if version == 0 {
             // Fresh database: create the schema and stamp it.
             store.create_schema()?;
+        } else if version == 1 {
+            // v1 → v2 appended the payments journal; existing rows are
+            // untouched, so the migration is a pure CREATE TABLE + stamp.
+            store.migrate_v1_v2()?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::UnknownSchema { found: version });
         }
@@ -153,7 +177,42 @@ impl SessionStore {
                  expires_at INTEGER NOT NULL,
                  request    TEXT    NOT NULL DEFAULT ''
              );
+             CREATE TABLE IF NOT EXISTS payments (
+                 id             TEXT PRIMARY KEY,
+                 token          TEXT NOT NULL,
+                 mac            TEXT NOT NULL,
+                 mint           TEXT NOT NULL,
+                 amount_sat     INTEGER NOT NULL DEFAULT 0,
+                 price_per_step INTEGER NOT NULL,
+                 step_size      INTEGER NOT NULL,
+                 metric         TEXT NOT NULL,
+                 phase          TEXT NOT NULL,
+                 ts             INTEGER NOT NULL
+             );
              COMMIT;",
+        )?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// v1 → v2: the payments journal table, appended without touching any
+    /// existing row so the upgrade is safe against a mid-write crash (the
+    /// stamp re-runs as a no-op if it already happened).
+    fn migrate_v1_v2(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS payments (
+                 id             TEXT PRIMARY KEY,
+                 token          TEXT NOT NULL,
+                 mac            TEXT NOT NULL,
+                 mint           TEXT NOT NULL,
+                 amount_sat     INTEGER NOT NULL DEFAULT 0,
+                 price_per_step INTEGER NOT NULL,
+                 step_size      INTEGER NOT NULL,
+                 metric         TEXT NOT NULL,
+                 phase          TEXT NOT NULL,
+                 ts             INTEGER NOT NULL
+             );",
         )?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -333,6 +392,98 @@ impl SessionStore {
             params![quote_id, state],
         )?;
         Ok(())
+    }
+
+    // ---- payments journal (v2) ---------------------------------------------
+    //
+    // One row per payment, keyed by sha256(token). The phase column is the
+    // write-ahead log: `intent` exists BEFORE wallet.receive() runs, so a
+    // crash anywhere between value-movement and session-grant leaves a row
+    // the boot reconciler can decide (mint NUT-07: spent ⇒ owed a session,
+    // unspent ⇒ nothing owed). Terminal phases are `received`,
+    // `rejected`, `reconcile-spent`, `reconcile-unspent`,
+    // `reconcile-zero-steps`; undecided phases (`intent`, `timeout-unknown`)
+    // are retried every boot — never failed, because the outcome is still
+    // unknown.
+
+    pub fn upsert_payment(&self, rec: &PaymentRecord) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO payments (id, token, mac, mint, amount_sat, price_per_step, step_size, metric, phase, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                 amount_sat = excluded.amount_sat,
+                 phase      = excluded.phase,
+                 ts         = excluded.ts",
+            params![
+                rec.id,
+                rec.token,
+                rec.mac,
+                rec.mint,
+                rec.amount_sat as i64,
+                rec.price_per_step as i64,
+                rec.step_size as i64,
+                rec.metric,
+                rec.phase,
+                rec.ts as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_payment(&self, id: &str) -> Result<Option<PaymentRecord>, StoreError> {
+        let rec = self
+            .conn
+            .query_row(
+                "SELECT id, token, mac, mint, amount_sat, price_per_step, step_size, metric, phase, ts
+                 FROM payments WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(PaymentRecord {
+                        id: r.get(0)?,
+                        token: r.get(1)?,
+                        mac: r.get(2)?,
+                        mint: r.get(3)?,
+                        amount_sat: r.get::<_, i64>(4)? as u64,
+                        price_per_step: r.get::<_, i64>(5)? as u64,
+                        step_size: r.get::<_, i64>(6)? as u64,
+                        metric: r.get(7)?,
+                        phase: r.get(8)?,
+                        ts: r.get::<_, i64>(9)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(rec)
+    }
+
+    pub fn payments_in_phase(&self, phases: &[&str]) -> Result<Vec<PaymentRecord>, StoreError> {
+        let placeholders = phases.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, token, mac, mint, amount_sat, price_per_step, step_size, metric, phase, ts
+             FROM payments WHERE phase IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            phases.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok(PaymentRecord {
+                id: r.get(0)?,
+                token: r.get(1)?,
+                mac: r.get(2)?,
+                mint: r.get(3)?,
+                amount_sat: r.get::<_, i64>(4)? as u64,
+                price_per_step: r.get::<_, i64>(5)? as u64,
+                step_size: r.get::<_, i64>(6)? as u64,
+                metric: r.get(7)?,
+                phase: r.get(8)?,
+                ts: r.get::<_, i64>(9)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Expire unpaid quotes whose deadline passed. Paid/issued quotes are left

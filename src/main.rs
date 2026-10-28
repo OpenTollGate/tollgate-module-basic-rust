@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use tollgate_module_basic_rust::{cli, config, http, identity, session, tracing_setup, wallet};
+use tollgate_module_basic_rust::{
+    cli, config, http, identity, payment_journal, session, tracing_setup, wallet,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -182,6 +184,52 @@ async fn main() {
         }
         if !valid.is_empty() {
             tracing::info!(count = valid.len(), "boot continuity: gates re-opened");
+        }
+    }
+
+    // Payment-journal reconciliation: every undecided payment — an `intent`
+    // whose process died between receive and the 200, or a `timeout-unknown`
+    // — is decided against the mint's own NUT-07 word. Spent means the
+    // customer paid: the owed session is granted durably and the gate
+    // opened. Unspent means nothing was taken: the row closes. Unreachable
+    // stays undecided and is retried next boot, never failed — the outcome
+    // is unknown, not negative.
+    {
+        let undecided_count = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .store()
+                .and_then(|st| {
+                    st.payments_in_phase(&payment_journal::UNDECIDED_PHASES)
+                        .ok()
+                })
+                .map(|v| v.len())
+                .unwrap_or(0)
+        };
+        if undecided_count > 0 {
+            tracing::info!(
+                count = undecided_count,
+                "payment journal: deciding undecided payments at boot"
+            );
+            let mints: Vec<String> = state
+                .config
+                .accepted_mints
+                .iter()
+                .map(|m| m.url.clone())
+                .collect();
+            let verifier = wallet::verify::TokenVerifier::new(mints);
+            let report = payment_journal::settle_undecided(&state.sessions, |t| {
+                let v = &verifier;
+                async move { v.check_state(&t).await }
+            })
+            .await;
+            tracing::info!(
+                granted = report.granted,
+                closed_unspent = report.closed_unspent,
+                zero_steps = report.zero_steps,
+                undecided = report.undecided,
+                "payment journal reconciled"
+            );
         }
     }
 
