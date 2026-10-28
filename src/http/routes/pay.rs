@@ -209,6 +209,27 @@ pub async fn handle_pay(
         );
     };
 
+    // NUT-10 spending conditions (P2PK/HTLC) lock the proofs to conditions
+    // this gateway cannot satisfy: receiving such a token takes value the
+    // wallet can never spend upstream. Refused at parse time — the cheapest
+    // check, before any network call or mint consultation.
+    if crate::wallet::verify::token_is_locked(&token) {
+        tracing::warn!("payment refused: token carries NUT-10 spending conditions");
+        let json = notice_json(
+            &state.identity,
+            "payment-error-invalid-token",
+            "payment rejected: token carries NUT-10 spending conditions (P2PK/HTLC) and cannot be received",
+        );
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                ("content-type", "application/json"),
+                ("access-control-allow-origin", "*"),
+            ],
+            json,
+        );
+    }
+
     // A6/A8: decide whether this token's mint is acceptable BEFORE any network
     // call. `verify()` performs a NUT-07 checkstate round trip, so checking the
     // allowlist afterwards meant a token from an unaccepted mint cost a full
