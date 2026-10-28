@@ -167,6 +167,30 @@ pub(crate) fn build_session_event(
     serde_json::to_value(&event).unwrap_or_else(|_| serde_json::json!({}))
 }
 
+/// HTTP semantics for a failed receive. A timeout is an UNKNOWN outcome,
+/// not a rejection: `tokio::time::timeout` cancels the receive saga
+/// mid-flight, and a cancelled saga may or may not have been accepted by the
+/// mint — the wallet reconciles it in-session, but at answer time the honest
+/// status is 504 `payment-outcome-unknown` with do-not-resubmit guidance.
+/// Answering 402 "rejected" invites the customer to treat a possibly-spent
+/// token as failed and pay twice.
+fn receive_failure_shape(
+    e: &crate::wallet::wallet::WalletError,
+) -> (StatusCode, &'static str, String) {
+    match e {
+        crate::wallet::wallet::WalletError::Timeout(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "payment-outcome-unknown",
+            "payment outcome unknown after timeout; do not resubmit this token".to_string(),
+        ),
+        other => (
+            StatusCode::PAYMENT_REQUIRED,
+            "payment-processing-failed",
+            format!("payment rejected: wallet receive failed: {other}"),
+        ),
+    }
+}
+
 pub async fn handle_pay(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -393,13 +417,10 @@ pub async fn handle_pay(
             Err(e) => {
                 tracing::warn!(error = %e, "wallet receive failed");
                 drop(wallet_guard);
-                let json = notice_json(
-                    &state.identity,
-                    "payment-processing-failed",
-                    &format!("payment rejected: wallet receive failed: {e}"),
-                );
+                let (status, code, message) = receive_failure_shape(&e);
+                let json = notice_json(&state.identity, code, &message);
                 return (
-                    StatusCode::PAYMENT_REQUIRED,
+                    status,
                     [
                         ("content-type", "application/json"),
                         ("access-control-allow-origin", "*"),
@@ -635,5 +656,25 @@ mod tests {
         // We verify the status code constant matches.
         let expected = StatusCode::PAYMENT_REQUIRED;
         assert_eq!(expected.as_u16(), 402);
+    }
+
+    /// A receive timeout is an UNKNOWN outcome: 504 + do-not-resubmit, never
+    /// a 402 that invites the customer to spend a second token.
+    #[test]
+    fn receive_timeout_maps_to_outcome_unknown_not_rejected() {
+        let e = crate::wallet::wallet::WalletError::Timeout(std::time::Duration::from_secs(30));
+        let (status, code, message) = receive_failure_shape(&e);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(code, "payment-outcome-unknown");
+        assert!(message.contains("do not resubmit"), "got: {message}");
+    }
+
+    /// Definitive receive failures keep the rejection semantics.
+    #[test]
+    fn definitive_receive_failure_stays_a_rejection() {
+        let e = crate::wallet::wallet::WalletError::TokenParse("bad token".into());
+        let (status, code, _) = receive_failure_shape(&e);
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(code, "payment-processing-failed");
     }
 }
