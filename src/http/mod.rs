@@ -1,6 +1,7 @@
 //! HTTP server module — axum router with all tollgate routes.
 
 pub mod mac;
+pub mod rate_limit;
 pub mod routes;
 
 use axum::extract::{ConnectInfo, State};
@@ -48,6 +49,12 @@ async fn stamp_identity(
 }
 
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_limits(state, rate_limit::RateLimiter::from_env())
+}
+
+/// Router with an injected rate limiter (tests need a deterministic budget;
+/// the production constructor reads `TOLLGATE_RATE_LIMIT_RPM`).
+pub fn create_router_with_limits(state: AppState, limiter: rate_limit::RateLimiter) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -93,6 +100,15 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             stamp_identity,
         ))
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            std::time::Duration::from_secs(35),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(limiter),
+            rate_limit::rate_limit_middleware,
+        ))
         .layer(cors)
         .with_state(state)
 }
@@ -117,6 +133,8 @@ pub fn create_test_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod identity_test;
+#[cfg(test)]
+mod rate_limit_test;
 
 #[cfg(test)]
 mod parity_routes_test;
