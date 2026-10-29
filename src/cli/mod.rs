@@ -98,6 +98,188 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<AppState>)
     }
 }
 
+/// CLI `wallet fund <token>`: an operator-initiated receive with the same
+/// durable-intent discipline as customer payments. The journal row carries
+/// the `cli-fund` marker (never collides with real MACs), is written BEFORE
+/// the receive, and any receive error terminalizes as `timeout-unknown` —
+/// a lost response after the mint accepted is indistinguishable from a
+/// definitive failure at the CDK boundary, so the boot reconciler decides
+/// it on NUT-07 evidence. No session is ever owed.
+async fn wallet_fund(token: &str, state: &AppState) -> String {
+    use crate::payment_journal::{self, PHASE_RECEIVED, PHASE_TIMEOUT_UNKNOWN};
+    let id = payment_journal::token_id(token);
+    let mint = crate::wallet::verify::token_mint_of(token).ok();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let rec = crate::session::store::PaymentRecord {
+        id,
+        token: token.to_string(),
+        mac: payment_journal::CLI_FUND_MAC.to_string(),
+        mint: mint.clone().unwrap_or_default(),
+        amount_sat: 0,
+        price_per_step: 1,
+        step_size: state.config.step_size,
+        metric: state.config.metric.clone(),
+        phase: payment_journal::PHASE_INTENT.to_string(),
+        ts: now,
+    };
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(store) = sessions.store() {
+            let _ = store.upsert_payment(&rec);
+        }
+    }
+    let wallet_guard = state.wallet.lock().await;
+    if let Some(ref wallet) = *wallet_guard {
+        match wallet.receive(token).await {
+            Ok(amount) => {
+                drop(wallet_guard);
+                let mut done = rec.clone();
+                done.phase = PHASE_RECEIVED.to_string();
+                done.amount_sat = amount;
+                done.ts = now;
+                {
+                    let sessions = state.sessions.lock().await;
+                    if let Some(store) = sessions.store() {
+                        let _ = store.upsert_payment(&done);
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "message": format!("funded {amount} sat into the wallet")
+                })
+                .to_string()
+                    + "\n"
+            }
+            Err(e) => {
+                drop(wallet_guard);
+                let mut amb = rec.clone();
+                amb.phase = PHASE_TIMEOUT_UNKNOWN.to_string();
+                amb.ts = now;
+                {
+                    let sessions = state.sessions.lock().await;
+                    if let Some(store) = sessions.store() {
+                        let _ = store.upsert_payment(&amb);
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "message": format!("fund outcome unknown ({e}); journaled ambiguous — the reconciler decides it on NUT-07 evidence; check 'status' after the next boot")
+                })
+                .to_string()
+                    + "\n"
+            }
+        }
+    } else {
+        serde_json::json!({
+            "success": false,
+            "error": "wallet not initialized"
+        })
+        .to_string()
+            + "\n"
+    }
+}
+
+/// CLI `wallet drain`: per-mint send of the full balance to a fresh token,
+/// with a durable drain journal — the intent before the send, the BEARER
+/// token string immediately after (the journal is the independent second
+/// copy that survives a crash between send and delivery), and an
+/// unresolved-saga gate: a mint whose previous drain's send saga is still
+/// settling is deferred (its output token may exist undelivered —
+/// re-sending could print the value twice).
+async fn wallet_drain(state: &AppState) -> String {
+    let wallet_guard = state.wallet.lock().await;
+    let Some(ref wallet) = *wallet_guard else {
+        return serde_json::json!({
+            "success": false,
+            "error": "wallet not initialized"
+        })
+        .to_string()
+            + "\n";
+    };
+    let balances = wallet.get_balance_by_mint().await.unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    let mut journal_rows: Vec<(usize, crate::session::store::DrainRecord)> = Vec::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for (idx, (mint, balance)) in balances.iter().enumerate() {
+        if *balance == 0 {
+            lines.push(format!("{mint}: 0 sat — nothing to drain"));
+            continue;
+        }
+        if wallet.mint_has_unresolved_send(mint).await.unwrap_or(false) {
+            lines.push(format!(
+                "{mint}: deferred — a previous drain's send saga is still settling; its token may exist undelivered; retry after settlement"
+            ));
+            continue;
+        }
+        let id = format!("cli-drain|{mint}|{now}");
+        let intent = crate::session::store::DrainRecord {
+            id: id.clone(),
+            mint: mint.clone(),
+            phase: "intent".to_string(),
+            token: String::new(),
+            amount_sat: *balance,
+            ts: now,
+        };
+        {
+            let sessions = state.sessions.lock().await;
+            if let Some(store) = sessions.store() {
+                if let Err(e) = store.upsert_drain(&intent) {
+                    lines.push(format!("{mint}: journal write failed ({e}) — refusing to send without a durable record"));
+                    continue;
+                }
+            }
+        }
+        match wallet.send(mint, *balance, true).await {
+            Ok(token) => {
+                lines.push(format!(
+                    "{mint}: drained {balance} sat — token journaled (wallet-drain second copy)"
+                ));
+                journal_rows.push((
+                    idx,
+                    crate::session::store::DrainRecord {
+                        phase: "sent".to_string(),
+                        token,
+                        ..intent.clone()
+                    },
+                ));
+            }
+            Err(e) => {
+                lines.push(format!(
+                    "{mint}: outcome ambiguous ({e}) — journaled; the send saga settles at next recovery; a token may exist undelivered"
+                ));
+                journal_rows.push((
+                    idx,
+                    crate::session::store::DrainRecord {
+                        phase: "ambiguous".to_string(),
+                        ..intent.clone()
+                    },
+                ));
+            }
+        }
+    }
+    drop(wallet_guard);
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(store) = sessions.store() {
+            for (_, row) in &journal_rows {
+                let _ = store.upsert_drain(row);
+            }
+        }
+    }
+    serde_json::json!({
+        "success": true,
+        "message": lines.join("\n")
+    })
+    .to_string()
+        + "\n"
+}
+
 async fn handle_command(cmd: &str, state: &AppState) -> String {
     match cmd {
         "version" => version_string(),
@@ -133,6 +315,19 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
                     + "\n"
             }
         }
+        cmd if cmd.starts_with("wallet fund ") => {
+            let token = cmd["wallet fund ".len()..].trim().to_string();
+            if token.is_empty() {
+                return serde_json::json!({
+                    "success": false,
+                    "error": "usage: wallet fund <token>"
+                })
+                .to_string()
+                    + "\n";
+            }
+            wallet_fund(&token, state).await
+        }
+        "wallet drain" => wallet_drain(state).await,
         "wallet balance" => {
             let wallet_guard = state.wallet.lock().await;
             if let Some(ref wallet) = *wallet_guard {

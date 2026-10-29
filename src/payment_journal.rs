@@ -38,6 +38,13 @@ pub const PHASE_RECONCILE_ZERO_STEPS: &str = "reconcile-zero-steps";
 
 pub const UNDECIDED_PHASES: [&str; 2] = [PHASE_INTENT, PHASE_TIMEOUT_UNKNOWN];
 
+/// MAC marker for CLI `wallet fund` rows: a receive the OPERATOR initiated,
+/// not a customer payment. Real client MACs are hex-colon strings, so this
+/// can never collide. Reconciliation advances these rows exactly like
+/// payments — the value lands via the same saga recovery — but owes no
+/// session and opens no gate: the operator sees the balance.
+pub const CLI_FUND_MAC: &str = "cli-fund";
+
 /// sha256(token) — the journal key. A hash rather than the raw string so the
 /// key is greppable in operator tooling without being a bearer instrument.
 pub fn token_id(token: &str) -> String {
@@ -154,6 +161,33 @@ where
             .as_secs();
         let mut terminal = rec.clone();
         terminal.ts = now;
+        // Operator-initiated rows (CLI `wallet fund`) owe no session: the
+        // value landing in the wallet IS the delivery. Spent ⇒ the fund
+        // succeeded, terminalize; unspent ⇒ nothing was taken, close;
+        // unreachable stays undecided like any payment.
+        if rec.mac == CLI_FUND_MAC {
+            match mint_word {
+                Ok(Some(spent_sat)) => {
+                    let guard = sessions.lock().await;
+                    if let Some(st) = guard.store() {
+                        terminal.phase = PHASE_RECONCILE_SPENT.to_string();
+                        terminal.amount_sat = spent_sat;
+                        let _ = st.upsert_payment(&terminal);
+                    }
+                    report.granted += 1;
+                }
+                Ok(None) => {
+                    let guard = sessions.lock().await;
+                    if let Some(st) = guard.store() {
+                        terminal.phase = PHASE_RECONCILE_UNSPENT.to_string();
+                        let _ = st.upsert_payment(&terminal);
+                    }
+                    report.closed_unspent += 1;
+                }
+                Err(_) => report.undecided += 1,
+            }
+            continue;
+        }
         match owed_decision(mint_word, &rec) {
             Owed::Grant {
                 allotment,
@@ -409,6 +443,31 @@ mod tests {
                 .and_then(|st| st.get_payment("id-4").ok().flatten())
                 .expect("row exists");
             assert_eq!(rec.phase, PHASE_RECONCILE_ZERO_STEPS);
+        }
+
+        /// An operator `wallet fund` row owes no session: spent ⇒ the value
+        /// landed, terminalize; the reconciler must not create a session or
+        /// touch the gate for a `cli-fund`-marked row.
+        #[tokio::test]
+        async fn cli_fund_marker_reconciles_without_a_session() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sessions = seed(tmp.path(), "id-f", "tok-f", CLI_FUND_MAC, 1);
+            let report = settle_undecided(&sessions, |t| async move {
+                Ok::<Option<u64>, String>(if t == "tok-f" { Some(7) } else { None })
+            })
+            .await;
+            assert_eq!(report.granted, 1);
+            let guard = sessions.lock().await;
+            assert!(
+                guard.get_session(CLI_FUND_MAC).is_none(),
+                "an operator fund owes no session"
+            );
+            let rec = guard
+                .store()
+                .and_then(|st| st.get_payment("id-f").ok().flatten())
+                .expect("row exists");
+            assert_eq!(rec.phase, PHASE_RECONCILE_SPENT);
+            assert_eq!(rec.amount_sat, 7);
         }
 
         /// Convergence: a second boot over a decided journal grants nothing

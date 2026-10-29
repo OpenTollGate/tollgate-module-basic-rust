@@ -35,6 +35,18 @@ fn build_http_client() -> reqwest::Client {
 /// Bootstrap token verifier. Accepts Cashu tokens, checks proofs against
 /// the mint's /v1/checkstate endpoint. Returns spendable amount in
 /// milli-sat (pricing_scale = 1000, so 1 sat → 1000 milli-units).
+/// The mint URL of a token, without constructing a verifier (the CLI fund
+/// path needs only the parse).
+pub fn token_mint_of(token_str: &str) -> Result<String, String> {
+    let token: Token = token_str
+        .parse()
+        .map_err(|e| format!("invalid Cashu token: {e}"))?;
+    let mint_url = token
+        .mint_url()
+        .map_err(|e| format!("token has no mint URL: {e}"))?;
+    Ok(mint_url.to_string().trim_end_matches('/').to_string())
+}
+
 pub struct TokenVerifier {
     accepted_mints: HashSet<String>,
     client: reqwest::Client,

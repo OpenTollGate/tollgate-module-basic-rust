@@ -262,6 +262,28 @@ impl TollWallet {
         }
     }
 
+    /// True when this mint's wallet has an incomplete SEND saga — a drain or
+    /// payout whose swap the mint may have accepted without our receiving
+    /// the output token. Re-issuing such a send could print the value twice
+    /// (the output token may exist undelivered), so the drain command defers
+    /// these mints until `recover_incomplete_sagas` settles them.
+    pub async fn mint_has_unresolved_send(&self, mint_url: &str) -> Result<bool, WalletError> {
+        let normalized = mint_url.trim_end_matches('/');
+        let wallet = match self.wallets.get(normalized) {
+            Some(w) => w.clone(),
+            None => return Ok(false),
+        };
+        let w = wallet.lock().await;
+        let sagas = w
+            .localstore
+            .get_incomplete_sagas()
+            .await
+            .map_err(|e| WalletError::Database(e.to_string()))?;
+        Ok(sagas
+            .into_iter()
+            .any(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Send(_))))
+    }
+
     /// Get total balance across all mints (maps gonuts `GetBalance`).
     pub async fn get_balance(&self) -> Result<u64, WalletError> {
         let mut total: u64 = 0;
