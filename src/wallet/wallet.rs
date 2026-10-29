@@ -609,29 +609,112 @@ impl TollWallet {
     }
 
     /// Load or generate a wallet seed (64 bytes) from the given path.
+    /// Load or create the 64-byte wallet seed, with a BIP39 mnemonic
+    /// backstop written alongside (`wallet_mnemonic.txt`, same directory,
+    /// 0600). The ecosystem durability ladder: local durable files, then
+    /// NUT-19 replay, then NUT-09 restore — and when the seed FILE itself
+    /// is lost (disk failure, botched migration), a mnemonic is the only
+    /// thing that re-derives it (NUT-13).
+    ///
+    /// Write ordering makes every crash point self-heal:
+    ///   neither file  → generate mnemonic FIRST, fsync, then derive+write
+    ///                    the seed (a crash between leaves mnemonic-only,
+    ///                    which the next boot re-derives from);
+    ///   mnemonic only → re-derive the seed (the crash case above);
+    ///   seed only     → pre-backstop wallet: loads exactly as before (a
+    ///                    mnemonic cannot be derived from a seed — the
+    ///                    operator can backfill by writing the file);
+    ///   both          → load, but a MISMATCH is a hard error: one of the
+    ///                    two files was replaced independently, and
+    ///                    silently preferring either would fork the wallet
+    ///                    identity, orphaning every deterministic
+    ///                    derivation;
+    ///   wrong size    → hard error (was: silent regeneration — a fresh
+    ///                    seed would orphan every derivation too).
     pub async fn load_or_create_seed(path: &Path) -> Result<[u8; 64], WalletError> {
-        if path.exists() {
+        let mnemonic_path = path.with_file_name("wallet_mnemonic.txt");
+
+        let seed_on_disk: Option<Vec<u8>> = if path.exists() {
             let data = tokio::fs::read(path).await?;
-            if data.len() == 64 {
-                let mut seed = [0u8; 64];
-                seed.copy_from_slice(&data);
-                return Ok(seed);
+            if data.len() != 64 {
+                tracing::error!(
+                    len = data.len(),
+                    "seed file has the wrong size — refusing to regenerate: a fresh seed would orphan every deterministic derivation. Restore the original 64-byte file from backup."
+                );
+                return Err(WalletError::Io(std::io::Error::other(format!(
+                    "seed file {} is {} bytes, expected 64 — refusing to regenerate (restore from backup)",
+                    path.display(),
+                    data.len()
+                ))));
             }
-            tracing::warn!("seed file wrong size, regenerating");
+            Some(data)
+        } else {
+            None
+        };
+
+        let mnemonic_on_disk: Option<String> = if mnemonic_path.exists() {
+            let m = tokio::fs::read_to_string(&mnemonic_path).await?;
+            let m = m.trim().to_string();
+            if m.is_empty() {
+                tracing::error!(
+                    "mnemonic file exists but is empty — refusing to proceed: an empty backstop cannot be distinguished from a torn write. Restore or delete the file deliberately."
+                );
+                return Err(WalletError::Io(std::io::Error::other(format!(
+                    "mnemonic file {} is empty — restore it or remove it deliberately",
+                    mnemonic_path.display()
+                ))));
+            }
+            Some(m)
+        } else {
+            None
+        };
+
+        match (mnemonic_on_disk, seed_on_disk) {
+            (Some(m), Some(seed_bytes)) => {
+                // Consistency check: the mnemonic must re-derive the seed.
+                let derived = crate::identity_derive::mnemonic_to_bip39_seed(&m)
+                    .map_err(|e| WalletError::Io(std::io::Error::other(e)))?;
+                let mut on_disk = [0u8; 64];
+                on_disk.copy_from_slice(&seed_bytes);
+                if derived != on_disk {
+                    tracing::error!(
+                        "wallet seed and mnemonic disagree — one file was replaced independently. Refusing to fork the wallet identity: restore the correct pair from backup."
+                    );
+                    return Err(WalletError::Io(std::io::Error::other(
+                        "seed/mnemonic mismatch: refusing to load — one of the two files was replaced; restore the matching pair from backup",
+                    )));
+                }
+                Ok(on_disk)
+            }
+            (Some(m), None) => {
+                // Crash between the mnemonic write and the seed write:
+                // re-derive the seed from the mnemonic and finish the job.
+                let seed = crate::identity_derive::mnemonic_to_bip39_seed(&m)
+                    .map_err(|e| WalletError::Io(std::io::Error::other(e)))?;
+                write_secret(path, &seed).await?;
+                tracing::info!("re-derived the wallet seed from the mnemonic backstop");
+                Ok(seed)
+            }
+            (None, Some(seed_bytes)) => {
+                // Pre-backstop wallet: no mnemonic exists to check against.
+                let mut seed = [0u8; 64];
+                seed.copy_from_slice(&seed_bytes);
+                Ok(seed)
+            }
+            (None, None) => {
+                // First boot: mnemonic first (crash-safe), then the seed.
+                let mnemonic = generate_mnemonic_24()?;
+                write_secret(&mnemonic_path, mnemonic.as_bytes()).await?;
+                let seed = crate::identity_derive::mnemonic_to_bip39_seed(&mnemonic)
+                    .map_err(|e| WalletError::Io(std::io::Error::other(e)))?;
+                write_secret(path, &seed).await?;
+                tracing::info!(
+                    "generated a new wallet with a 24-word mnemonic backstop at {}",
+                    mnemonic_path.display()
+                );
+                Ok(seed)
+            }
         }
-
-        let mut seed = [0u8; 64];
-        rand::thread_rng().fill(&mut seed);
-        tokio::fs::write(path, seed).await?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
-        }
-
-        Ok(seed)
     }
 }
 
@@ -650,6 +733,53 @@ pub struct MeltQuoteInfo {
     pub quote_id: String,
     pub amount: u64,
     pub fee: u64,
+}
+
+/// Write a secret file 0600 and fsync it, plus its directory entry — the
+/// first-creation durability rule the payment journal follows too.
+async fn write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::fs::write(path, bytes).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    if let Some(dir) = path.parent() {
+        if let Ok(f) = std::fs::File::open(dir) {
+            let _ = f.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Generate a fresh 24-word BIP39 mnemonic: 256 random bits of entropy,
+/// an 8-bit (first checksum byte) SHA-256 checksum, 24 11-bit indices over
+/// the embedded English wordlist (the same list identity_derive pins).
+fn generate_mnemonic_24() -> Result<String, WalletError> {
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+
+    let mut entropy = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut entropy);
+    let checksum = Sha256::digest(&entropy);
+    let mut bits: Vec<bool> = Vec::with_capacity(264);
+    for b in entropy.iter() {
+        for i in (0..8).rev() {
+            bits.push((b >> i) & 1 == 1);
+        }
+    }
+    for i in (0..8).rev() {
+        bits.push((checksum[0] >> i) & 1 == 1);
+    }
+    let wl = crate::identity_derive::words();
+    let words: Vec<&str> = bits
+        .chunks(11)
+        .map(|c| {
+            let idx = c.iter().fold(0usize, |acc, b| (acc << 1) | (*b as usize));
+            wl[idx]
+        })
+        .collect();
+    Ok(words.join(" "))
 }
 
 #[cfg(test)]
@@ -824,5 +954,96 @@ mod tests {
             .block_on(wallet.rotate_inactive_keyset_proofs("https://never-registered.example"))
             .unwrap();
         assert_eq!(n, 0, "nothing to rotate on an unknown mint");
+    }
+
+    #[test]
+    fn first_boot_writes_mnemonic_that_rederives_the_seed() {
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let seed = rt
+            .block_on(TollWallet::load_or_create_seed(&seed_path))
+            .unwrap();
+        let mnemonic_path = tmp.path().join("wallet_mnemonic.txt");
+        let m = std::fs::read_to_string(&mnemonic_path).unwrap();
+        assert_eq!(m.split_whitespace().count(), 24, "24-word backstop");
+        let rederived = crate::identity_derive::mnemonic_to_bip39_seed(m.trim()).unwrap();
+        assert_eq!(
+            rederived.as_slice(),
+            seed.as_slice(),
+            "the mnemonic must re-derive exactly the on-disk seed"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&mnemonic_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mnemonic is 0600");
+    }
+
+    #[test]
+    fn mnemonic_only_boot_rederives_the_seed() {
+        // The crash window between the two writes self-heals.
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let mnemonic_path = tmp.path().join("wallet_mnemonic.txt");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let seed1 = rt
+            .block_on(TollWallet::load_or_create_seed(&seed_path))
+            .unwrap();
+        std::fs::remove_file(&seed_path).unwrap();
+        let seed2 = rt
+            .block_on(TollWallet::load_or_create_seed(&seed_path))
+            .unwrap();
+        assert_eq!(seed1, seed2, "re-derived from the mnemonic backstop");
+    }
+
+    #[test]
+    fn seed_mnemonic_mismatch_fails_loudly() {
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let mnemonic_path = tmp.path().join("wallet_mnemonic.txt");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _ = rt
+            .block_on(TollWallet::load_or_create_seed(&seed_path))
+            .unwrap();
+        // Independently replace the seed: the next boot must refuse.
+        std::fs::write(&seed_path, [7u8; 64]).unwrap();
+        let err = rt
+            .block_on(TollWallet::load_or_create_seed(&seed_path))
+            .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn corrupt_seed_file_fails_instead_of_regenerating() {
+        // The old behavior silently regenerated — orphaning every
+        // deterministic derivation. Fund-safety: refuse and tell the
+        // operator to restore from backup.
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        std::fs::write(&seed_path, [0u8; 32]).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(TollWallet::load_or_create_seed(&seed_path))
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing"), "got: {err}");
+    }
+
+    #[test]
+    fn seed_only_wallet_loads_unchanged() {
+        // Pre-backstop wallets keep working; no mnemonic can be derived
+        // from a seed, so none is written behind the operator's back.
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("wallet_seed.bin");
+        let mnemonic_path = tmp.path().join("wallet_mnemonic.txt");
+        let mut seed = [9u8; 64];
+        std::fs::write(&seed_path, seed).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let loaded = rt
+            .block_on(TollWallet::load_or_create_seed(&seed_path))
+            .unwrap();
+        seed.copy_from_slice(&loaded);
+        assert!(!mnemonic_path.exists(), "no backfill of a mnemonic");
     }
 }
