@@ -15,3 +15,5 @@
 # Python bytecode (a .pyc was accidentally committed in #25; keep them out)
 __pycache__/
 *.py[cod]
+dist/
+*.ipk

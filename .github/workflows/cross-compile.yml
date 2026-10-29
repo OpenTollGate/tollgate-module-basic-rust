@@ -92,8 +92,23 @@ jobs:
           cp target/${{ matrix.target }}/release/tollgate-module-basic-rust \
              openwrt/tollgate-module-basic-rust-${{ matrix.target }}
 
+      # .ipk for direct opkg installs (OpenWrt ≤ 24.10). 25.12+ is
+      # apk-native (ADBd packages) — produced by the SDK feed
+      # (openwrt/Makefile), not by a CI-side tarball.
+      - name: Build .ipk
+        run: |
+          sudo apt-get install -y binutils >/dev/null 2>&1 || true
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)          ARCH=x86_64 ;;
+            aarch64-unknown-linux-musl)         ARCH=aarch64 ;;
+            armv7-unknown-linux-musleabihf)     ARCH=armv7 ;;
+          esac
+          PKG_VERSION="${GITHUB_SHA::7}" packaging/build-ipk.sh "$ARCH"
+
       - uses: actions/upload-artifact@v4
         with:
           name: tollgate-${{ matrix.target }}
-          path: openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+          path: |
+            openwrt/tollgate-module-basic-rust-${{ matrix.target }}
+            dist/*.ipk
           if-no-files-found: error
