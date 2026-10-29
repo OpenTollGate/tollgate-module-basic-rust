@@ -89,9 +89,7 @@ pub fn parse_ndsctl_json(output: &str) -> Result<Option<(u64, u64)>, MeteringErr
 /// Poll usage for a client MAC via `ndsctl json <mac>`.
 /// Returns (used_bytes, total_bytes). On any error, returns (0, 0).
 pub async fn poll_usage(mac: &str) -> Result<(u64, u64), MeteringError> {
-    let output = tokio::process::Command::new("ndsctl")
-        .args(["json", mac])
-        .output()
+    let output = ndsctl_exec(std::path::Path::new("ndsctl"), &["json", mac])
         .await
         .map_err(|e| MeteringError::NotFound(e.to_string()))?;
 
@@ -137,9 +135,7 @@ pub async fn poll_usage_with(
     // `poll_usage_with` was missed when `poll_usage` was corrected, and it is the one
     // `/usage` actually calls -- so `/usage` stayed a permanent zero even after the first
     // fix landed. Two near-identical functions, one fixed: worth noting as a real hazard.
-    let output = tokio::process::Command::new(ndsctl.as_ref())
-        .args(["json", mac])
-        .output()
+    let output = ndsctl_exec(ndsctl.as_ref(), &["json", mac])
         .await
         .map_err(|e| MeteringError::NotFound(e.to_string()))?;
 
@@ -289,11 +285,26 @@ pub fn classify_gate_output(success: bool, text: &str) -> GateOutcome {
     GateOutcome::Refused(text.trim().to_string())
 }
 
-pub async fn open_gate_with(ndsctl: impl AsRef<std::path::Path>, mac: &str) -> GateOutcome {
-    let out = tokio::process::Command::new(ndsctl.as_ref())
-        .args(["auth", mac])
+/// ndsctl is not thread-safe: NoDogSplash can deadlock under concurrent
+/// invocations (NDS #387), so every exec funnels through this lock — the
+/// fork's NDSCTL_MUTEX mandate (issue #70's class). A global (not
+/// per-mac): the hazard is inside ndsctl, not per-client.
+static NDSCTL_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Run one ndsctl invocation, serialized against every other.
+async fn ndsctl_exec(
+    ndsctl: &std::path::Path,
+    args: &[&str],
+) -> std::io::Result<std::process::Output> {
+    let _guard = NDSCTL_MUTEX.lock().await;
+    tokio::process::Command::new(ndsctl)
+        .args(args)
         .output()
-        .await;
+        .await
+}
+
+pub async fn open_gate_with(ndsctl: impl AsRef<std::path::Path>, mac: &str) -> GateOutcome {
+    let out = ndsctl_exec(ndsctl.as_ref(), &["auth", mac]).await;
     let out = match out {
         Ok(o) => o,
         Err(e) => return GateOutcome::Unavailable(e.to_string()),
@@ -332,10 +343,7 @@ pub fn classify_gate_close(success: bool, text: &str) -> GateOutcome {
 
 /// Close the gate for `mac` (`ndsctl deauth <mac>`).
 pub async fn close_gate_with(ndsctl: impl AsRef<std::path::Path>, mac: &str) -> GateOutcome {
-    let out = tokio::process::Command::new(ndsctl.as_ref())
-        .args(["deauth", mac])
-        .output()
-        .await;
+    let out = ndsctl_exec(ndsctl.as_ref(), &["deauth", mac]).await;
     let out = match out {
         Ok(o) => o,
         Err(e) => return GateOutcome::Unavailable(e.to_string()),

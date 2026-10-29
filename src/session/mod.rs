@@ -351,6 +351,14 @@ impl SessionManager {
     pub fn update_usage(&mut self, mac: &str, used: u64) {
         let allotment = match self.sessions.get_mut(mac) {
             Some(s) => {
+                // MONOTONIC: ndsctl's counter can regress (NDS restart,
+                // client re-auth resets its accounting) — a plain
+                // overwrite could un-terminalize an exhausted session or
+                // hand back credit the customer already consumed. The
+                // gateway's record only ever moves forward.
+                if used < s.used {
+                    return;
+                }
                 s.used = used;
                 s.allotment
             }
@@ -453,3 +461,30 @@ mod tests;
 
 #[cfg(test)]
 mod gate_close_test;
+/// ndsctl's counter can regress (NDS restart, client re-auth resets its
+/// accounting) — the gateway's record must never move backwards: a
+/// regressed overwrite could un-terminalize an exhausted session or
+/// hand back consumed credit (fork issue #71's class).
+#[test]
+fn usage_writes_are_monotonic() {
+    let mut mgr = crate::session::SessionManager::new();
+    mgr.create_session("aa:bb:cc:dd:ee:41", 1000, "bytes", 3600);
+    mgr.update_usage("aa:bb:cc:dd:ee:41", 400);
+    assert_eq!(
+        mgr.get_session("aa:bb:cc:dd:ee:41").unwrap().used,
+        400,
+        "forward writes apply"
+    );
+    mgr.update_usage("aa:bb:cc:dd:ee:41", 0);
+    assert_eq!(
+        mgr.get_session("aa:bb:cc:dd:ee:41").unwrap().used,
+        400,
+        "a regressed ndsctl reading must not roll the counter back"
+    );
+    mgr.update_usage("aa:bb:cc:dd:ee:41", 1000);
+    assert_eq!(
+        mgr.get_session("aa:bb:cc:dd:ee:41").unwrap().used,
+        1000,
+        "terminal exhaustion still reachable"
+    );
+}
