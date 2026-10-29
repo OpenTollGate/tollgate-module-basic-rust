@@ -17,15 +17,25 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Serialize;
 
-/// Corpus `http03-balance/no-session`: only `status`, `session_active`, `mac`.
+/// Corpus `http03-balance/no-session`: `status`, `session_active`, `mac`,
+/// plus the observed zero fields.
 ///
-/// `allotment`/`usage`/`remaining` are deliberately ABSENT rather than zero. A session
-/// that does not exist and a session with 0 bytes left are different facts, and a client
-/// that sees `remaining: 0` will buy again for no reason.
+/// `usage`/`allotment`/`remaining` are PRESENT as exact zeros — the corpus
+/// records them under `additive_fields_observed` with live rig evidence
+/// (`{"status":1,"session_active":false,"usage":0,"allotment":0,"remaining":0,...}`),
+/// because the Go origin's serializer emits them unconditionally (no
+/// omitempty). They were previously omitted here on the theory that 0 and
+/// nonexistent are different facts — true, but the wire contract is the Go
+/// byte shape, and a client branching on key presence (the PRTA
+/// session-endpoint probes do exactly this) reads their absence as a
+/// protocol error.
 #[derive(Debug, Serialize)]
 struct NoSession {
     status: u8,
     session_active: bool,
+    usage: u64,
+    allotment: u64,
+    remaining: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     mac: Option<String>,
 }
@@ -102,6 +112,9 @@ pub async fn handle_balance(
                 None => NoSession {
                     status: 1,
                     session_active: false,
+                    usage: 0,
+                    allotment: 0,
+                    remaining: 0,
                     mac: Some(m.clone()),
                 }
                 .into_string(),
@@ -112,6 +125,9 @@ pub async fn handle_balance(
         None => NoSession {
             status: 1,
             session_active: false,
+            usage: 0,
+            allotment: 0,
+            remaining: 0,
             mac: None,
         }
         .into_string(),

@@ -43,7 +43,10 @@ fn empty_state() -> AppState {
     }
 }
 
-/// Corpus `http03-balance/no-session`: `{status, session_active, mac}`.
+/// Corpus `http03-balance/no-session`: `{status, session_active, mac}` plus the
+/// observed zero fields (`usage:0, allotment:0, remaining:0` — the corpus's
+/// `additive_fields_observed`, with live rig evidence; the Go serializer emits
+/// them unconditionally).
 ///
 /// `status: 1` is the corpus's success marker. The previous shape had no `status` at
 /// all, so the JSON parsed but every field a client looked for was missing.
@@ -74,12 +77,11 @@ async fn no_session_matches_corpus_shape() {
     );
 }
 
-/// Corpus `http03-balance/non-get-method`: 405. Asserted at the router layer, not here.
-///
-/// This test documents WHY it is not in this file: `handle_balance` is the GET handler
-/// already, so a method check here could never fail. It belongs to a route-table test.
+/// The corpus's `additive_fields_observed`: the Go origin serializes
+/// usage/allotment/remaining unconditionally, so a no-session body carries
+/// them as exact zeros. `metric`/`start_time` remain absent (Go omitempty).
 #[tokio::test]
-async fn metric_and_allotment_only_appear_when_a_session_is_active() {
+async fn no_session_carries_the_observed_zero_fields() {
     let resp = handle_balance(
         State(empty_state()),
         ConnectInfo(std::net::SocketAddr::from(([192, 168, 1, 50], 44444))),
@@ -88,11 +90,15 @@ async fn metric_and_allotment_only_appear_when_a_session_is_active() {
     .await
     .into_response();
     let (_, v) = body_of(resp).await;
-    // Corpus `no-session` lists only status/session_active/mac. Emitting `allotment: 0`
-    // for a device with no session would be a fabricated measurement -- indistinguishable
-    // from a real session that has 0 bytes left.
+    assert_eq!(v["usage"], 0, "corpus additive field, got {v}");
+    assert_eq!(v["allotment"], 0, "corpus additive field, got {v}");
+    assert_eq!(v["remaining"], 0, "corpus additive field, got {v}");
     assert!(
-        v.get("allotment").is_none(),
-        "no session means no allotment field, got {v}"
+        v.get("metric").is_none(),
+        "metric is omitempty in the origin and stays absent without a session: {v}"
+    );
+    assert!(
+        v.get("start_time").is_none(),
+        "start_time is omitempty in the origin and stays absent: {v}"
     );
 }
