@@ -35,6 +35,9 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
 /// Default receive/send/melt timeout (matches Go's 30s).
+/// Restore scans keysets in batches against the mint — far longer than a
+/// single op, but still bounded (a hanging mint must not wedge the CLI).
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors returned by TollWallet operations.
@@ -59,6 +62,14 @@ pub enum WalletError {
 /// TollWallet wraps multiple CDK Wallet instances (one per mint URL) behind
 /// a tokio Mutex for thread-safe serialized access. CDK's saga pattern
 /// ensures operations are atomic — no swap-counter race.
+/// Per-mint result of a NUT-13 restore (see `TollWallet::restore_mint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoredSummary {
+    pub unspent_sat: u64,
+    pub spent_sat: u64,
+    pub pending_sat: u64,
+}
+
 /// Read-only keyset hygiene report for one mint: unspent-proof census,
 /// how many proofs sit on keysets the mint has retired, and which HELD
 /// keysets expire inside the warn window (a keyset we hold nothing on is
@@ -301,6 +312,33 @@ impl TollWallet {
         Ok(sagas
             .into_iter()
             .any(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Send(_))))
+    }
+
+    /// NUT-13 restore for one mint (CDK `Wallet::restore`: batched NUT-09
+    /// state scans, gap-limited, recovered outputs kept in the wallet).
+    /// The spend side of the seed backstop: with only the mnemonic, the
+    /// operator re-derives the seed, boots, and restores — this returns
+    /// the per-mint census (unspent recovered / already spent / pending).
+    pub async fn restore_mint(&self, mint_url: &str) -> Result<RestoredSummary, WalletError> {
+        let normalized = crate::mint_url::canonicalize(mint_url);
+        let wallet = match self.wallets.get(normalized.as_str()) {
+            Some(w) => w.clone(),
+            None => return Err(WalletError::WalletNotFound(normalized)),
+        };
+        let result = timeout(RESTORE_TIMEOUT, async {
+            let w = wallet.lock().await;
+            w.restore().await
+        })
+        .await;
+        match result {
+            Ok(Ok(r)) => Ok(RestoredSummary {
+                unspent_sat: r.unspent.into(),
+                spent_sat: r.spent.into(),
+                pending_sat: r.pending.into(),
+            }),
+            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Err(_) => Err(WalletError::Timeout(RESTORE_TIMEOUT)),
+        }
     }
 
     /// Read-only keyset hygiene (per mint): refreshes the keyset list from
@@ -945,6 +983,23 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(35), wallet.receive(token)).await;
 
         assert!(result.is_ok(), "receive should not hang forever");
+    }
+
+    #[test]
+    fn restore_on_unregistered_mint_errors_with_wallet_not_found() {
+        // The CLI surface contract: restore reports per-mint errors as
+        // data (the handler degrades an Err into a per-mint error entry,
+        // not a failed command) — the wallet seam itself names the mint.
+        let tmp = TempDir::new().unwrap();
+        let wallet = make_test_wallet(tmp.path(), vec![]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(wallet.restore_mint("https://never-registered.example"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::wallet::wallet::WalletError::WalletNotFound(_)
+        ));
     }
 
     #[test]
