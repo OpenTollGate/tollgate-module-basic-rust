@@ -23,12 +23,11 @@ pub enum MintSelectionError {
 /// Units a mint may price in, per TIP-01 (`price_unit` is `sats`).
 const SUPPORTED_PRICE_UNITS: &[&str] = &["sats", "sat", "msat"];
 
-/// Normalise a mint URL for comparison.
-///
-/// Trailing slashes and host casing vary between what an operator writes in
-/// config and what a token carries, and neither is meaningful.
+/// Normalise a mint URL for comparison — CDK's canonical form (see
+/// `crate::mint_url`), so the mint that SELECTS here is the same identity
+/// the wallet map and the per-mint database filenames use.
 fn normalise(url: &str) -> String {
-    url.trim().trim_end_matches('/').to_ascii_lowercase()
+    crate::mint_url::canonicalize(url)
 }
 
 /// Select the configuration for the mint a token came from.
