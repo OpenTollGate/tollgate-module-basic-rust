@@ -340,16 +340,28 @@ pub async fn handle_pay(
                 .unwrap_or_default()
                 .as_secs();
             let mut sessions = state.sessions.lock().await;
-            let session = sessions.create_session(
-                &rec.mac,
-                allotment,
-                &rec.metric,
-                // Exhaustion-driven, like the original grant: the frozen
-                // terms priced this access once already.
-                u64::MAX / 4,
-            );
+            // Replay semantics with ADDITIVE grants (#63): a live session
+            // already carrying this payment's value is REPORTED as-is —
+            // re-granting would stack allotment on every retry. Only a
+            // LOST session (expired, replaced) re-grants, additively, so
+            // a retry can never erase a sibling's paid remainder either.
+            let already_live = sessions.get_session(&rec.mac).is_some();
+            if !already_live {
+                sessions.grant_additive(
+                    &rec.mac,
+                    allotment,
+                    &rec.metric,
+                    // Exhaustion-driven, like the original grant: the frozen
+                    // terms priced this access once already.
+                    u64::MAX / 4,
+                );
+            }
+            let persist_ok = sessions
+                .get_session(&rec.mac)
+                .map(|sess| sess.allotment > 0)
+                .unwrap_or(false);
             drop(sessions);
-            if session.allotment == 0 {
+            if !persist_ok {
                 let json = notice_json(
                     &state.identity,
                     "session-error",
@@ -364,12 +376,21 @@ pub async fn handle_pay(
                     json,
                 );
             }
-            let _ = crate::metering::open_gate(&rec.mac).await;
+            if !already_live {
+                let _ = crate::metering::open_gate(&rec.mac).await;
+            }
+            let live_allotment = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get_session(&rec.mac)
+                    .map(|sess| sess.allotment)
+                    .unwrap_or(allotment)
+            };
             let resp = build_session_event(
                 &state.config,
                 &state.identity,
                 &rec.mac,
-                allotment,
+                live_allotment,
                 start_time,
                 None,
             );
