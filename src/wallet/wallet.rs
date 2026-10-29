@@ -59,6 +59,17 @@ pub enum WalletError {
 /// TollWallet wraps multiple CDK Wallet instances (one per mint URL) behind
 /// a tokio Mutex for thread-safe serialized access. CDK's saga pattern
 /// ensures operations are atomic — no swap-counter race.
+/// Read-only keyset hygiene report for one mint: unspent-proof census,
+/// how many proofs sit on keysets the mint has retired, and which HELD
+/// keysets expire inside the warn window (a keyset we hold nothing on is
+/// mint history, not a fund risk).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeysetHygiene {
+    pub unspent_proofs: usize,
+    pub proofs_on_inactive_keysets: usize,
+    pub soonest_expiry_keysets: Vec<String>,
+}
+
 pub struct TollWallet {
     wallets: HashMap<String, Arc<Mutex<Wallet>>>,
     seed: [u8; 64],
@@ -282,6 +293,133 @@ impl TollWallet {
         Ok(sagas
             .into_iter()
             .any(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Send(_))))
+    }
+
+    /// Read-only keyset hygiene (per mint): refreshes the keyset list from
+    /// the mint, counts unspent proofs parked on keysets the mint reports
+    /// INACTIVE — value that can still be spent but will never be issued
+    /// to again and should be rotated — and lists HELD keysets whose
+    /// final_expiry falls inside the warn window. Never moves value.
+    pub async fn keyset_hygiene(
+        &self,
+        mint_url: &str,
+        expiry_warn_days: u64,
+    ) -> Result<KeysetHygiene, WalletError> {
+        use cdk::wallet::types::KeysetLoadPolicy;
+
+        let normalized = mint_url.trim_end_matches('/');
+        let wallet = match self.wallets.get(normalized) {
+            Some(w) => w.clone(),
+            None => return Ok(KeysetHygiene::default()),
+        };
+
+        let result = timeout(OP_TIMEOUT, async {
+            let w = wallet.lock().await;
+            let keysets = w.keysets(KeysetLoadPolicy::CacheThenNetwork).await?;
+            let unspent = w.get_unspent_proofs().await?;
+
+            let inactive: std::collections::HashSet<cdk::nuts::nut02::Id> = keysets
+                .iter()
+                .filter(|ks| ks.active == Some(false))
+                .map(|ks| ks.id)
+                .collect();
+            let on_inactive = unspent
+                .iter()
+                .filter(|p| inactive.contains(&p.keyset_id))
+                .count();
+
+            // Only keysets we actually HOLD unspent proofs on belong in the
+            // expiry warning: mints advertise historical keysets we never
+            // used, and warning about those every sweep is permanent noise
+            // that obscures the fund-risk signal.
+            let held: std::collections::HashSet<cdk::nuts::nut02::Id> =
+                unspent.iter().map(|p| p.keyset_id).collect();
+            let warn_cutoff = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + expiry_warn_days * 24 * 60 * 60;
+            let soonest: Vec<String> = keysets
+                .iter()
+                .filter_map(|ks| {
+                    ks.final_expiry
+                        .filter(|_| held.contains(&ks.id))
+                        .filter(|e| *e < warn_cutoff)
+                        .map(|_| ks.id.to_string())
+                })
+                .collect();
+
+            Ok::<_, cdk::Error>(KeysetHygiene {
+                unspent_proofs: unspent.len(),
+                proofs_on_inactive_keysets: on_inactive,
+                soonest_expiry_keysets: soonest,
+            })
+        })
+        .await;
+
+        match result {
+            Ok(Ok(h)) => Ok(h),
+            Ok(Err(e)) => Err(WalletError::Cdk(e)),
+            Err(_) => Err(WalletError::Timeout(OP_TIMEOUT)),
+        }
+    }
+
+    /// Proactively rotate proofs off retired keysets: swaps every unspent
+    /// proof on an INACTIVE keyset to the mint's active keyset via CDK's
+    /// public self-swap — same-mint, value never leaves. Returns the
+    /// number of proofs rotated. Errors and timeouts trigger the same
+    /// detached saga recovery as every money-moving wrapper: a cancelled
+    /// swap leaves a persisted half-executed saga that must not wait for
+    /// the next boot.
+    pub async fn rotate_inactive_keyset_proofs(&self, mint_url: &str) -> Result<u32, WalletError> {
+        use cdk::amount::SplitTarget;
+        use cdk::wallet::types::KeysetLoadPolicy;
+
+        let normalized = mint_url.trim_end_matches('/');
+        let wallet = match self.wallets.get(normalized) {
+            Some(w) => w.clone(),
+            None => return Ok(0),
+        };
+        let normalized_owned = normalized.to_string();
+
+        let result = timeout(OP_TIMEOUT, async {
+            let w = wallet.lock().await;
+            let keysets = w.keysets(KeysetLoadPolicy::CacheThenNetwork).await?;
+            let inactive: std::collections::HashSet<cdk::nuts::nut02::Id> = keysets
+                .iter()
+                .filter(|ks| ks.active == Some(false))
+                .map(|ks| ks.id)
+                .collect();
+            if inactive.is_empty() {
+                return Ok::<_, cdk::Error>(0u64);
+            }
+            let unspent = w.get_unspent_proofs().await?;
+            let stale: Vec<cdk::nuts::nut00::Proof> = unspent
+                .into_iter()
+                .filter(|p| inactive.contains(&p.keyset_id))
+                .collect();
+            if stale.is_empty() {
+                return Ok(0u64);
+            }
+            let count = stale.len() as u64;
+            w.swap(None, SplitTarget::default(), stale, None, true, false)
+                .await?;
+            Ok(count)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(n)) => Ok(n as u32),
+            Ok(Err(e)) => {
+                let e = WalletError::Cdk(e);
+                spawn_post_timeout_recovery(&wallet, normalized_owned);
+                Err(e)
+            }
+            Err(_) => {
+                spawn_post_timeout_recovery(&wallet, normalized_owned);
+                Err(WalletError::Timeout(OP_TIMEOUT))
+            }
+        }
     }
 
     /// Get total balance across all mints (maps gonuts `GetBalance`).
@@ -669,5 +807,22 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(35), wallet.receive(token)).await;
 
         assert!(result.is_ok(), "receive should not hang forever");
+    }
+
+    #[test]
+    fn keyset_hygiene_on_unregistered_mint_is_default() {
+        // Read-only check: an unknown mint reports the empty census rather
+        // than an error — the boot sweep treats it as "nothing to do".
+        let tmp = TempDir::new().unwrap();
+        let wallet = make_test_wallet(tmp.path(), vec![]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let h = rt
+            .block_on(wallet.keyset_hygiene("https://never-registered.example", 30))
+            .unwrap();
+        assert_eq!(h, KeysetHygiene::default());
+        let n = rt
+            .block_on(wallet.rotate_inactive_keyset_proofs("https://never-registered.example"))
+            .unwrap();
+        assert_eq!(n, 0, "nothing to rotate on an unknown mint");
     }
 }
