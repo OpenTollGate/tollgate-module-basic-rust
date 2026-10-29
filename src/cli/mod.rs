@@ -98,6 +98,65 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<AppState>)
     }
 }
 
+/// CLI `wallet restore`: the NUT-13 spend side of the seed backstop (#23
+/// made the seed re-derivable from the mnemonic; this command spends that
+/// ability). For every registered mint, runs CDK's full NUT-13 restore —
+/// batched NUT-09 state scans with a gap limit, recovered outputs kept,
+/// spent/pending amounts reported — so an operator with only the mnemonic
+/// (lost disk, botched migration, replaced router) can bring the wallet
+/// back: derive the seed, boot, run restore, then `wallet drain`.
+///
+/// Read-only with respect to THIS module's state: restore talks to the
+/// mint and the wallet's own database only; it never touches sessions,
+/// gates, or the payment journal. Idempotent — a second run finds the
+/// already-restored outputs and reports them as (un)spent.
+async fn wallet_restore(state: &AppState) -> String {
+    let wallet_guard = state.wallet.lock().await;
+    let Some(ref wallet) = *wallet_guard else {
+        return serde_json::json!({
+            "success": false,
+            "error": "wallet not initialized"
+        })
+        .to_string()
+            + "\n";
+    };
+    let balances = wallet.get_balance_by_mint().await.unwrap_or_default();
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    for (mint, pre_balance) in &balances {
+        match wallet.restore_mint(mint).await {
+            Ok(r) => {
+                let post_balance = wallet
+                    .get_balance_by_mint()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(m, _)| m == mint)
+                    .map(|(_, b)| b)
+                    .unwrap_or(*pre_balance);
+                results.push(serde_json::json!({
+                    "mint": mint,
+                    "restored_unspent_sat": r.unspent_sat,
+                    "already_spent_sat": r.spent_sat,
+                    "pending_sat": r.pending_sat,
+                    "balance_before_sat": pre_balance,
+                    "balance_after_sat": post_balance,
+                }));
+            }
+            Err(e) => results.push(serde_json::json!({
+                "mint": mint,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    drop(wallet_guard);
+    serde_json::json!({
+        "success": true,
+        "message": serde_json::to_string(&results).unwrap_or_default()
+    })
+    .to_string()
+        + "\n"
+}
+
 /// CLI `wallet fund <token>`: an operator-initiated receive with the same
 /// durable-intent discipline as customer payments. The journal row carries
 /// the `cli-fund` marker (never collides with real MACs), is written BEFORE
@@ -328,6 +387,7 @@ async fn handle_command(cmd: &str, state: &AppState) -> String {
             wallet_fund(&token, state).await
         }
         "wallet drain" => wallet_drain(state).await,
+        "wallet restore" => wallet_restore(state).await,
         "wallet balance" => {
             let wallet_guard = state.wallet.lock().await;
             if let Some(ref wallet) = *wallet_guard {
