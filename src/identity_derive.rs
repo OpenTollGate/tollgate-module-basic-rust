@@ -217,6 +217,29 @@ mod tests {
 /// go-nostr/nip06: BIP39 seed (PBKDF2-HMAC-SHA512(mnemonic, "mnemonic", 2048,
 /// 64B)) -> BIP32 master -> m/44'/1237'/0'/0/0. The mnemonic must be 12 valid
 /// words; the private key is the final child's key bytes.
+/// Validate a BIP39 mnemonic (12 or 24 words, all in the English list)
+/// and return its 64-byte BIP39 seed (PBKDF2-HMAC-SHA512, 2048 rounds).
+/// Shared by the NIP-06 identity derivation and the wallet's NUT-13
+/// mnemonic backstop so the two can never diverge.
+pub fn mnemonic_to_bip39_seed(mnemonic: &str) -> Result<[u8; 64], String> {
+    let mn_words: Vec<&str> = mnemonic.split_whitespace().collect();
+    if mn_words.len() != 12 && mn_words.len() != 24 {
+        return Err(format!(
+            "mnemonic must have 12 or 24 words, got {}",
+            mn_words.len()
+        ));
+    }
+    let wl = words();
+    for w in &mn_words {
+        if !wl.contains(w) {
+            return Err(format!("word not in BIP39 English list: {w}"));
+        }
+    }
+    let mut seed = [0u8; 64];
+    pbkdf2_hmac_sha512(mnemonic.as_bytes(), b"mnemonic", 2048, &mut seed);
+    Ok(seed)
+}
+
 pub fn private_key_from_mnemonic(mnemonic: &str) -> Result<String, String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha512;
