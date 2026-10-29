@@ -349,6 +349,69 @@ async fn main() {
         }
     }
 
+    // Keyset hygiene (R10): every boot and each 6h, per configured mint —
+    // refresh the keyset list, warn about unspent proofs parked on keysets
+    // the mint retired (they can still be spent but will never be issued to
+    // again) and about HELD keysets expiring within 30 days, and rotate
+    // retired-keyset proofs to the active keyset (same-mint self-swap —
+    // value never leaves the mint). Read-only checks log; errors defer to
+    // the next sweep. Payout safety falls out of rotation: melts and sends
+    // select from active-keyset proofs.
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            async fn hygiene_pass(state: &Arc<http::AppState>) {
+                let mints: Vec<String> = state
+                    .config
+                    .accepted_mints
+                    .iter()
+                    .map(|m| m.url.clone())
+                    .collect();
+                for mint in &mints {
+                    let wallet = state.wallet.lock().await;
+                    let Some(w) = wallet.as_ref() else {
+                        continue;
+                    };
+                    match w.keyset_hygiene(mint, 30).await {
+                        Ok(h) => {
+                            if h.proofs_on_inactive_keysets > 0 {
+                                tracing::warn!(
+                                    mint = %mint,
+                                    proofs = h.proofs_on_inactive_keysets,
+                                    "keyset hygiene: unspent proofs on retired keysets — rotating"
+                                );
+                                match w.rotate_inactive_keyset_proofs(mint).await {
+                                    Ok(n) => {
+                                        tracing::info!(mint = %mint, rotated = n, "keyset hygiene: rotated proofs to the active keyset")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(mint = %mint, error = %e, "keyset hygiene: rotation failed; retried next sweep")
+                                    }
+                                }
+                            }
+                            if !h.soonest_expiry_keysets.is_empty() {
+                                tracing::warn!(
+                                    mint = %mint,
+                                    keysets = ?h.soonest_expiry_keysets,
+                                    "keyset hygiene: held keysets expire within 30 days — plan rotation"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(mint = %mint, error = %e, "keyset hygiene unavailable (mint unreachable?)")
+                        }
+                    }
+                }
+            }
+            hygiene_pass(&sweep_state).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            loop {
+                tick.tick().await;
+                hygiene_pass(&sweep_state).await;
+            }
+        });
+    }
+
     // ADR-0006 §1/§3/§4: periodic gate-close sweep. Before this, close_expired ran
     // ONLY at startup, so a session could expire or exhaust while the daemon ran and
     // the client kept the access it paid for. The sweep closes terminal sessions and
