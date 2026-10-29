@@ -115,3 +115,78 @@ fn in_phase_returns_only_the_undecided_rows_the_reconciler_walks() {
     assert!(ids.contains(&"p-intent"));
     assert!(ids.contains(&"p-timeout"));
 }
+
+/// v2 → v3 appended the drains journal: existing rows untouched, drains usable.
+#[test]
+fn v2_database_migrates_in_place_to_v3() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("tollgate.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (mac TEXT PRIMARY KEY, allotment INTEGER, used INTEGER, metric TEXT, expiry INTEGER, granted_at INTEGER);
+             CREATE TABLE closed_usage (mac TEXT PRIMARY KEY, used INTEGER, closed_at INTEGER);
+             CREATE TABLE quotes (quote_id TEXT PRIMARY KEY, amount INTEGER, unit TEXT, state TEXT, created_at INTEGER, expires_at INTEGER, request TEXT DEFAULT '');
+             CREATE TABLE payments (id TEXT PRIMARY KEY, token TEXT, mac TEXT, mint TEXT, amount_sat INTEGER DEFAULT 0, price_per_step INTEGER, step_size INTEGER, metric TEXT, phase TEXT, ts INTEGER);
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO payments (id, token, mac, mint, amount_sat, price_per_step, step_size, metric, phase, ts)
+             VALUES ('p1','tok','aa:bb:cc:dd:ee:ff','https://m.example',5,1,1000,'bytes','received',1)",
+            [],
+        )
+        .unwrap();
+    }
+    let st = super::store::SessionStore::open(&db).unwrap();
+    let rec = st.get_payment("p1").unwrap().unwrap();
+    assert_eq!(
+        rec.amount_sat, 5,
+        "pre-existing payment row survives the migration"
+    );
+    st.upsert_drain(&super::store::DrainRecord {
+        id: "cli-drain|m|1".to_string(),
+        mint: "https://m.example".to_string(),
+        phase: "sent".to_string(),
+        token: "cashuBtoken".to_string(),
+        amount_sat: 21,
+        ts: 2,
+    })
+    .unwrap();
+    let got = st.get_drain("cli-drain|m|1").unwrap().unwrap();
+    assert_eq!(
+        got.token, "cashuBtoken",
+        "the bearer second copy round-trips"
+    );
+    let amb = st.drains_in_phase(&["ambiguous"]).unwrap();
+    assert!(amb.is_empty(), "sent rows are not ambiguous");
+    drop(st);
+    super::store::SessionStore::open(&db).expect("re-open after migration is stable");
+}
+
+/// Drain phase transitions keep a stable id and record the token only on send.
+#[test]
+fn drain_row_lifecycle_intent_to_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let st = super::store::SessionStore::open(&tmp.path().join("tollgate.db")).unwrap();
+    let base = super::store::DrainRecord {
+        id: "d1".to_string(),
+        mint: "https://m.example".to_string(),
+        phase: "intent".to_string(),
+        token: String::new(),
+        amount_sat: 9,
+        ts: 1,
+    };
+    st.upsert_drain(&base).unwrap();
+    st.upsert_drain(&super::store::DrainRecord {
+        phase: "sent".to_string(),
+        token: "cashuBx".to_string(),
+        ts: 2,
+        ..base.clone()
+    })
+    .unwrap();
+    let got = st.get_drain("d1").unwrap().unwrap();
+    assert_eq!(got.phase, "sent");
+    assert_eq!(got.token, "cashuBx");
+    assert_eq!(got.mint, "https://m.example", "identity stable");
+}

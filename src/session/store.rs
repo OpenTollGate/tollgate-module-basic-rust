@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::CustomerSession;
 
 /// Current on-disk schema. Bump when the layout changes, and add a migration.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -75,6 +75,22 @@ pub struct StoredQuote {
     pub created_at: u64,
     pub expires_at: u64,
     pub request: String,
+}
+
+/// One journaled CLI drain attempt (v3). `token` is the BEARER instrument
+/// the mint returned — the journal is the independent second copy that
+/// survives a crash between send and delivery. Entries are never removed:
+/// tokens are bearer instruments; the operator sweeps the file once the
+/// funds are secured elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainRecord {
+    /// `mint|attempt-counter` — one row per drain attempt per mint.
+    pub id: String,
+    pub mint: String,
+    pub phase: String,
+    pub token: String,
+    pub amount_sat: u64,
+    pub ts: u64,
 }
 
 /// One journaled payment (v2). Pricing terms are frozen at intent time so
@@ -145,6 +161,10 @@ impl SessionStore {
             // v1 → v2 appended the payments journal; existing rows are
             // untouched, so the migration is a pure CREATE TABLE + stamp.
             store.migrate_v1_v2()?;
+        } else if version == 2 {
+            // v2 → v3 appended the drains journal (CLI wallet drain); pure
+            // CREATE TABLE + stamp, same reasoning as v1 → v2.
+            store.migrate_v2_v3()?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::UnknownSchema { found: version });
         }
@@ -189,7 +209,33 @@ impl SessionStore {
                  phase          TEXT NOT NULL,
                  ts             INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS drains (
+                 id         TEXT PRIMARY KEY,
+                 mint       TEXT NOT NULL,
+                 phase      TEXT NOT NULL,
+                 token      TEXT NOT NULL DEFAULT '',
+                 amount_sat INTEGER NOT NULL DEFAULT 0,
+                 ts         INTEGER NOT NULL
+             );
              COMMIT;",
+        )?;
+        self.conn
+            .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// v2 → v3: the drains journal (CLI `wallet drain`), same pure-append
+    /// shape as v1 → v2 — existing rows untouched, stamp re-runnable.
+    fn migrate_v2_v3(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS drains (
+                 id         TEXT PRIMARY KEY,
+                 mint       TEXT NOT NULL,
+                 phase      TEXT NOT NULL,
+                 token      TEXT NOT NULL DEFAULT '',
+                 amount_sat INTEGER NOT NULL DEFAULT 0,
+                 ts         INTEGER NOT NULL
+             );",
         )?;
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -503,6 +549,75 @@ impl SessionStore {
                 metric: r.get(7)?,
                 phase: r.get(8)?,
                 ts: r.get::<_, i64>(9)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_drain(&self, rec: &DrainRecord) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO drains (id, mint, phase, token, amount_sat, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 phase      = excluded.phase,
+                 token      = excluded.token,
+                 amount_sat = excluded.amount_sat,
+                 ts         = excluded.ts",
+            params![
+                rec.id,
+                rec.mint,
+                rec.phase,
+                rec.token,
+                rec.amount_sat as i64,
+                rec.ts as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_drain(&self, id: &str) -> Result<Option<DrainRecord>, StoreError> {
+        let rec = self
+            .conn
+            .query_row(
+                "SELECT id, mint, phase, token, amount_sat, ts FROM drains WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(DrainRecord {
+                        id: r.get(0)?,
+                        mint: r.get(1)?,
+                        phase: r.get(2)?,
+                        token: r.get(3)?,
+                        amount_sat: r.get::<_, i64>(4)? as u64,
+                        ts: r.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(rec)
+    }
+
+    /// Every drain row whose phase is in the given set — the drain command
+    /// consults `ambiguous` rows so an unsettled send saga defers the mint.
+    pub fn drains_in_phase(&self, phases: &[&str]) -> Result<Vec<DrainRecord>, StoreError> {
+        let placeholders = phases.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, mint, phase, token, amount_sat, ts FROM drains WHERE phase IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            phases.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok(DrainRecord {
+                id: r.get(0)?,
+                mint: r.get(1)?,
+                phase: r.get(2)?,
+                token: r.get(3)?,
+                amount_sat: r.get::<_, i64>(4)? as u64,
+                ts: r.get::<_, i64>(5)? as u64,
             })
         })?;
         let mut out = Vec::new();
