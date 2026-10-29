@@ -393,3 +393,62 @@ fn partial_config_yields_default_step_size_not_zero() {
     std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The Go origin marshals durations as int64 nanoseconds; this module's
+/// own defaults are humanized strings. Both must parse — before this,
+/// every Go-written config (the drop-in promise) failed the parse and,
+/// before the fail-closed fix, silently defaulted the whole gateway.
+/// Regression proven live: the PRTA venue's harvested Go config carries
+/// `"probe_timeout": 10000000000` and `"discovery_timeout": 300000000000`.
+#[test]
+fn go_nanosecond_durations_parse() {
+    let _g = env_guard();
+    let dir = std::env::temp_dir().join(format!("tollgate-go-dur-{}", rand_hex()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{"config_version":"v0.0.10","metric":"bytes","step_size":22020096,
+            "upstream_detector":{"probe_timeout":10000000000,"probe_retry_count":3,
+            "probe_retry_delay":2000000000,"discovery_timeout":300000000000},
+            "upstream_session_manager":{"usage_tracking":{"data_monitoring_interval":500000000}}}"#,
+    )
+    .unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
+    let cfg = load_config()
+        .expect("Go-format config must parse")
+        .expect("must be Some");
+    let d = &cfg.upstream_detector;
+    assert_eq!(d.probe_timeout, "10s", "1e10 ns");
+    assert_eq!(d.probe_retry_delay, "2s", "2e9 ns");
+    assert_eq!(d.discovery_timeout, "5m0s", "3e11 ns");
+    assert_eq!(
+        cfg.upstream_session_manager
+            .usage_tracking
+            .data_monitoring_interval,
+        "500ms",
+        "5e8 ns"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Humanized strings (this module's own default format) keep parsing.
+#[test]
+fn humanized_duration_strings_still_parse() {
+    let _g = env_guard();
+    let dir = std::env::temp_dir().join(format!("tollgate-hum-dur-{}", rand_hex()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{"config_version":"v0.0.10","metric":"bytes","step_size":22020096,
+            "upstream_detector":{"probe_timeout":"10s","discovery_timeout":"5m0s"}}"#,
+    )
+    .unwrap();
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);
+    let cfg = load_config()
+        .expect("humanized config must parse")
+        .expect("must be Some");
+    assert_eq!(cfg.upstream_detector.probe_timeout, "10s");
+    assert_eq!(cfg.upstream_detector.discovery_timeout, "5m0s");
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+    let _ = fs::remove_dir_all(&dir);
+}

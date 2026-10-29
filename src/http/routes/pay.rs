@@ -542,18 +542,18 @@ pub async fn handle_pay(
                 {
                     let sessions = state.sessions.lock().await;
                     if let Some(store) = sessions.store() {
-                        let phase =
-                            if matches!(e, crate::wallet::wallet::WalletError::Timeout(_)) {
-                                crate::payment_journal::PHASE_TIMEOUT_UNKNOWN
-                            } else {
-                                crate::payment_journal::PHASE_REJECTED
-                            };
+                        let phase = if matches!(e, crate::wallet::wallet::WalletError::Timeout(_)) {
+                            crate::payment_journal::PHASE_TIMEOUT_UNKNOWN
+                        } else {
+                            crate::payment_journal::PHASE_REJECTED
+                        };
                         let rec = payment_rec(phase, 0);
                         let _ = store.upsert_payment(&rec);
                     }
                 }
                 let (status, code, message) = receive_failure_shape(&e);
-                let json = notice_json(&state.identity, code, &message);                return (
+                let json = notice_json(&state.identity, code, &message);
+                return (
                     status,
                     [
                         ("content-type", "application/json"),
