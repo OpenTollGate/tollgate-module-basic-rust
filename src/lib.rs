@@ -6,6 +6,7 @@ pub mod http;
 pub mod identity;
 pub mod identity_derive;
 pub mod metering;
+pub mod mint_url;
 pub mod nostr_event;
 pub mod payment_journal;
 pub mod session;

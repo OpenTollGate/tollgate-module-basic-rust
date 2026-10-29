@@ -129,12 +129,20 @@ impl TollWallet {
         }
     }
 
+    /// Whether a wallet is registered for this spelling (canonicalized) —
+    /// the probe the case-divergence regression pins.
+    #[cfg(test)]
+    fn mint_registered(&self, mint_url: &str) -> Result<bool, WalletError> {
+        let normalized = crate::mint_url::canonicalize(mint_url);
+        Ok(self.wallets.contains_key(normalized.as_str()))
+    }
+
     fn is_mint_accepted(&self, mint_url: &str) -> bool {
         self.accepted_mints.is_empty()
             || self
                 .accepted_mints
                 .iter()
-                .any(|m| m.trim_end_matches('/') == mint_url.trim_end_matches('/'))
+                .any(|m| crate::mint_url::mint_urls_equal(m, mint_url))
     }
 
     /// Register a mint and open a CDK wallet for it.
@@ -144,12 +152,12 @@ impl TollWallet {
             return Err(WalletError::MintNotAccepted(mint_url.to_string()));
         }
 
-        let normalized = mint_url.trim_end_matches('/');
-        if self.wallets.contains_key(normalized) {
+        let normalized = crate::mint_url::canonicalize(mint_url);
+        if self.wallets.contains_key(normalized.as_str()) {
             return Ok(());
         }
 
-        let db_path = self.db_path_for_mint(normalized);
+        let db_path = self.db_path_for_mint(normalized.as_str());
         if let Some(parent) = db_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -208,11 +216,11 @@ impl TollWallet {
             .mint_url()
             .map_err(|e| WalletError::TokenParse(format!("{e}")))?
             .to_string();
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = crate::mint_url::canonicalize(&mint_url);
 
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -243,10 +251,10 @@ impl TollWallet {
         amount_sat: u64,
         include_fee: bool,
     ) -> Result<String, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = crate::mint_url::canonicalize(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -279,8 +287,8 @@ impl TollWallet {
     /// (the output token may exist undelivered), so the drain command defers
     /// these mints until `recover_incomplete_sagas` settles them.
     pub async fn mint_has_unresolved_send(&self, mint_url: &str) -> Result<bool, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
-        let wallet = match self.wallets.get(normalized) {
+        let normalized = crate::mint_url::canonicalize(mint_url);
+        let wallet = match self.wallets.get(normalized.as_str()) {
             Some(w) => w.clone(),
             None => return Ok(false),
         };
@@ -307,8 +315,8 @@ impl TollWallet {
     ) -> Result<KeysetHygiene, WalletError> {
         use cdk::wallet::types::KeysetLoadPolicy;
 
-        let normalized = mint_url.trim_end_matches('/');
-        let wallet = match self.wallets.get(normalized) {
+        let normalized = crate::mint_url::canonicalize(mint_url);
+        let wallet = match self.wallets.get(normalized.as_str()) {
             Some(w) => w.clone(),
             None => return Ok(KeysetHygiene::default()),
         };
@@ -375,8 +383,8 @@ impl TollWallet {
         use cdk::amount::SplitTarget;
         use cdk::wallet::types::KeysetLoadPolicy;
 
-        let normalized = mint_url.trim_end_matches('/');
-        let wallet = match self.wallets.get(normalized) {
+        let normalized = crate::mint_url::canonicalize(mint_url);
+        let wallet = match self.wallets.get(normalized.as_str()) {
             Some(w) => w.clone(),
             None => return Ok(0),
         };
@@ -450,10 +458,10 @@ impl TollWallet {
         mint_url: &str,
         amount_sat: u64,
     ) -> Result<MintQuoteInfo, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = crate::mint_url::canonicalize(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -511,10 +519,10 @@ impl TollWallet {
         mint_url: &str,
         quote_id: &str,
     ) -> Result<String, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = crate::mint_url::canonicalize(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -537,10 +545,10 @@ impl TollWallet {
     /// Mint tokens from a paid quote (NUT-04, maps gonuts `MintTokens`).
     /// CDK API: `wallet.mint(quote_id, SplitTarget, Option<SpendingConditions>)`.
     pub async fn mint_tokens(&self, mint_url: &str, quote_id: &str) -> Result<u64, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = crate::mint_url::canonicalize(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -565,10 +573,10 @@ impl TollWallet {
     /// Request a melt quote + prepare melt (NUT-05, maps gonuts `RequestMeltQuote` + `Melt`).
     /// CDK flow: `melt_quote(BOLT11, invoice)` → `prepare_melt(quote_id, meta)` → `confirm()`.
     pub async fn melt(&self, mint_url: &str, invoice: &str) -> Result<MeltQuoteInfo, WalletError> {
-        let normalized = mint_url.trim_end_matches('/');
+        let normalized = crate::mint_url::canonicalize(mint_url);
         let wallet = self
             .wallets
-            .get(normalized)
+            .get(normalized.as_str())
             .ok_or_else(|| WalletError::WalletNotFound(normalized.to_string()))?
             .clone();
 
@@ -1045,5 +1053,25 @@ mod tests {
             .unwrap();
         seed.copy_from_slice(&loaded);
         assert!(!mnemonic_path.exists(), "no backfill of a mnemonic");
+    }
+
+    /// The §3 divergence: comparison lowercased while map keys did not — a
+    /// config spelling `https://Mint.Example` selected the mint but the
+    /// receive lookup missed the map (WalletNotFound). One canonical form
+    /// (CDK's MintUrl) at both sites closes it.
+    #[tokio::test]
+    async fn case_variant_config_and_token_mint_are_one_wallet() {
+        let tmp = TempDir::new().unwrap();
+        let mut wallet = make_test_wallet(tmp.path(), vec!["https://Mint.Example".to_string()]);
+        wallet
+            .ensure_mint("https://Mint.Example")
+            .await
+            .expect("config spelling registers");
+        assert!(
+            wallet
+                .mint_registered("https://mint.example")
+                .expect("registered query"),
+            "the token's lowercase spelling must find the wallet the config spelling registered"
+        );
     }
 }
