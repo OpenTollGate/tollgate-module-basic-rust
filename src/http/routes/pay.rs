@@ -174,6 +174,61 @@ pub(crate) fn build_session_event(
 /// status is 504 `payment-outcome-unknown` with do-not-resubmit guidance.
 /// Answering 402 "rejected" invites the customer to treat a possibly-spent
 /// token as failed and pay twice.
+/// Go's `isRateLimitError` parity: the rate-limit signal comes from the
+/// mint's protocol surface (text the mint itself returns), so mirroring
+/// the string match is wire parity, not smell.
+fn is_mint_rate_limit(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("429") || m.contains("rate limit") || m.contains("too many requests")
+}
+
+/// The receive-error taxonomy (the fork's R16/#55, mirroring Go's
+/// post-receive classifier): the same underlying condition emits the same
+/// `code` tag as the Go origin, and every failure path carries one — a
+/// shared portal can tell a dead token from a busy mint from a retired
+/// keyset instead of parsing prose.
+fn receive_failure_code(e: &crate::wallet::wallet::WalletError) -> &'static str {
+    let msg = e.to_string().to_ascii_lowercase();
+    if matches!(e, crate::wallet::wallet::WalletError::Timeout(_)) {
+        // The outer timeout is an AMBIGUOUS outcome — handled by
+        // receive_failure_shape's 504 arm; reaching here would be a bug.
+        return "payment-outcome-unknown";
+    }
+    if msg.contains("already spent")
+        || msg.contains("already used")
+        || msg.contains("token already spent")
+    {
+        return "payment-error-token-spent";
+    }
+    if is_mint_rate_limit(&msg) {
+        return "mint-rate-limited";
+    }
+    if msg.contains("keyset")
+        && (msg.contains("expired") || msg.contains("inactive") || msg.contains("unknown"))
+    {
+        return "payment-error-keyset-expired";
+    }
+    if msg.contains("fee")
+        && (msg.contains("insufficient") || msg.contains("below") || msg.contains("cannot cover"))
+    {
+        return "payment-error-below-swap-fee";
+    }
+    if msg.contains("unreachable")
+        || msg.contains("connection refused")
+        || msg.contains("connect error")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("dns")
+    {
+        // Definitive transport errors surfaced by CDK (the outer timeout
+        // is handled first); a 5xx after the mint processed the swap is
+        // ambiguous, but CDK reports those as saga-persisted errors that
+        // recovery decides — the classifier only names what it saw.
+        return "payment-error-mint-unreachable";
+    }
+    "payment-processing-failed"
+}
+
 fn receive_failure_shape(
     e: &crate::wallet::wallet::WalletError,
 ) -> (StatusCode, &'static str, String) {
@@ -183,11 +238,25 @@ fn receive_failure_shape(
             "payment-outcome-unknown",
             "payment outcome unknown after timeout; do not resubmit this token".to_string(),
         ),
-        other => (
-            StatusCode::PAYMENT_REQUIRED,
-            "payment-processing-failed",
-            format!("payment rejected: wallet receive failed: {other}"),
-        ),
+        other => {
+            let code = receive_failure_code(other);
+            let message = match code {
+                "payment-error-token-spent" => {
+                    "This e-cash note has already been spent".to_string()
+                }
+                "mint-rate-limited" => {
+                    "Mint is rate-limiting requests. Please try again in a moment.".to_string()
+                }
+                "payment-error-keyset-expired" => format!(
+                    "This e-cash note was issued on a keyset the mint has retired; it cannot be recovered by retrying. Cause: {other}"
+                ),
+                "payment-error-mint-unreachable" => {
+                    "Mint temporarily unavailable. Please try again, or use a token from another mint.".to_string()
+                }
+                _ => format!("payment processing failed: {other}"),
+            };
+            (StatusCode::PAYMENT_REQUIRED, code, message)
+        }
     }
 }
 
@@ -856,6 +925,46 @@ mod tests {
         // We verify the status code constant matches.
         let expected = StatusCode::PAYMENT_REQUIRED;
         assert_eq!(expected.as_u16(), 402);
+    }
+
+    /// The R16 taxonomy (fork #55 / Go's post-receive classifier): the same
+    /// condition, the same code tag as the Go origin.
+    #[test]
+    fn receive_taxonomy_matches_go_codes() {
+        use crate::wallet::wallet::WalletError as W;
+        let cases: Vec<(W, &str)> = vec![
+            (
+                W::Database("mint returned 429 too many requests".into()),
+                "mint-rate-limited",
+            ),
+            (
+                W::Database("the mint reports rate limit exceeded".into()),
+                "mint-rate-limited",
+            ),
+            (
+                W::Cdk(cdk::Error::UnknownKeySet),
+                "payment-error-keyset-expired",
+            ),
+            (
+                W::Database("token already spent".into()),
+                "payment-error-token-spent",
+            ),
+            (
+                W::TokenParse("fee insufficient for swap".into()),
+                "payment-error-below-swap-fee",
+            ),
+            (
+                W::Database("mint unreachable: connection refused".into()),
+                "payment-error-mint-unreachable",
+            ),
+            (
+                W::TokenParse("something novel".into()),
+                "payment-processing-failed",
+            ),
+        ];
+        for (e, want) in cases {
+            assert_eq!(receive_failure_code(&e), want, "input: {e}");
+        }
     }
 
     /// A receive timeout is an UNKNOWN outcome: 504 + do-not-resubmit, never
