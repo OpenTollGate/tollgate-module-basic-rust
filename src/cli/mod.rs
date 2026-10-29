@@ -260,6 +260,10 @@ mod tests {
 
     static INIT: Once = Once::new();
 
+    /// Serializes `SessionManager::open` across this module's tests (see the
+    /// comment at the open site for the race this prevents).
+    static STORE_OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn make_test_state() -> Arc<AppState> {
         INIT.call_once(|| {
             // Redirect config/identity paths to a temp dir so tests
@@ -295,16 +299,26 @@ mod tests {
         // success to machine history. `TOLLGATE_STATE_DB` is deliberately
         // not consulted here: a stray environment variable must not point
         // tests at operator state either.
+        //
+        // The OPEN is serialized: every test in this module opens the same
+        // shared store file, and two concurrent `SessionManager::open`s race
+        // on the WAL pragma + schema-create — the loser fails closed and
+        // `exit(78)`s the whole test binary (observed as a nondeterministic
+        // full-suite kill). Connections remain concurrently usable after
+        // open; only the open itself needs the lock.
         let state_db = crate::config::config_dir().join("tollgate.db");
-        let sessions = Arc::new(tokio::sync::Mutex::new(
+        let sessions = Arc::new(tokio::sync::Mutex::new({
+            let _open_guard = STORE_OPEN_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             SessionManager::open(&state_db).unwrap_or_else(|e| {
                 eprintln!(
                     "FATAL: cannot open session store at {}: {e}",
                     state_db.display()
                 );
                 std::process::exit(78);
-            }),
-        ));
+            })
+        }));
         Arc::new(AppState {
             config,
             identity,
