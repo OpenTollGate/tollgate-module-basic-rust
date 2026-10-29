@@ -291,14 +291,16 @@ mod tests {
         // P1: durable. Same fail-closed rule as main.rs — an unreadable store
         // must not be read as "no sessions".
         //
-        // Hermetic by derivation: the state db follows `config_dir()`, which
-        // INIT has already redirected to the test temp dir above. The former
-        // hardcoded fallback (`/etc/tollgate/tollgate.db`) made the test
-        // binary open — and fail-closed `exit(78)` on, and even migrate —
-        // the HOST's real state on any machine that has one, coupling test
-        // success to machine history. `TOLLGATE_STATE_DB` is deliberately
-        // not consulted here: a stray environment variable must not point
-        // tests at operator state either.
+        // Hermetic BY CONSTRUCTION: the state db path is derived directly
+        // from the test temp dir, NOT from `config_dir()`/`TOLLGATE_TEST_CONFIG_DIR`.
+        // The env var is process-global and OTHER modules' tests legitimately
+        // remove it mid-suite (config tests set/remove per test); a CLI test
+        // whose `config_dir()` read lands in such a window computed
+        // `/etc/tollgate` — opening, fail-closing `exit(78)` on, and even
+        // SCHEMA-MIGRATING the host's real state (observed twice on the
+        // bench host). No env read means no window. `TOLLGATE_STATE_DB` is
+        // likewise never consulted: a stray environment variable must not
+        // point tests at operator state.
         //
         // The OPEN is serialized: every test in this module opens the same
         // shared store file, and two concurrent `SessionManager::open`s race
@@ -306,7 +308,9 @@ mod tests {
         // `exit(78)`s the whole test binary (observed as a nondeterministic
         // full-suite kill). Connections remain concurrently usable after
         // open; only the open itself needs the lock.
-        let state_db = crate::config::config_dir().join("tollgate.db");
+        let state_db = std::env::temp_dir()
+            .join("tollgate-cli-tests")
+            .join("tollgate.db");
         let sessions = Arc::new(tokio::sync::Mutex::new({
             let _open_guard = STORE_OPEN_LOCK
                 .lock()
