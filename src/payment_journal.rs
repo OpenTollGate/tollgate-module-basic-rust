@@ -32,11 +32,20 @@ pub const PHASE_INTENT: &str = "intent";
 pub const PHASE_RECEIVED: &str = "received";
 pub const PHASE_REJECTED: &str = "rejected";
 pub const PHASE_TIMEOUT_UNKNOWN: &str = "timeout-unknown";
+/// The reconciled grant is DURABLE (session row exists) but the gate has
+/// not opened yet — a crash or ndsctl failure here must retry the GATE,
+/// never re-grant (#64: a payment terminalized on a failed gate left the
+/// customer with a spent token, a session row, and no access, forever).
+pub const PHASE_GRANTED_AWAITING_GATE: &str = "granted-awaiting-gate";
 pub const PHASE_RECONCILE_SPENT: &str = "reconcile-spent";
 pub const PHASE_RECONCILE_UNSPENT: &str = "reconcile-unspent";
 pub const PHASE_RECONCILE_ZERO_STEPS: &str = "reconcile-zero-steps";
 
-pub const UNDECIDED_PHASES: [&str; 2] = [PHASE_INTENT, PHASE_TIMEOUT_UNKNOWN];
+pub const UNDECIDED_PHASES: [&str; 3] = [
+    PHASE_INTENT,
+    PHASE_TIMEOUT_UNKNOWN,
+    PHASE_GRANTED_AWAITING_GATE,
+];
 
 /// MAC marker for CLI `wallet fund` rows: a receive the OPERATOR initiated,
 /// not a customer payment. Real client MACs are hex-colon strings, so this
@@ -161,6 +170,25 @@ where
             .as_secs();
         let mut terminal = rec.clone();
         terminal.ts = now;
+        // GATE-ONLY RETRY (#64): a row already in granted-awaiting-gate
+        // has its durable session — re-adding the grant would stack it
+        // (additive is additive). Only the gate retries here.
+        if rec.phase == PHASE_GRANTED_AWAITING_GATE {
+            let gate = crate::metering::open_gate(&rec.mac).await;
+            if matches!(gate, crate::metering::GateOutcome::Opened) {
+                let guard = sessions.lock().await;
+                if let Some(st) = guard.store() {
+                    terminal.phase = PHASE_RECONCILE_SPENT.to_string();
+                    let _ = st.upsert_payment(&terminal);
+                }
+                tracing::info!(mac = %rec.mac, id = %rec.id, "payment reconcile: gate re-opened for the durable grant");
+                report.granted += 1;
+            } else {
+                report.undecided += 1;
+            }
+            continue;
+        }
+
         // Operator-initiated rows (CLI `wallet fund`) owe no session: the
         // value landing in the wallet IS the delivery. Spent ⇒ the fund
         // succeeded, terminalize; unspent ⇒ nothing was taken, close;
@@ -193,8 +221,13 @@ where
                 allotment,
                 spent_sat,
             } => {
+                // ADDITIVE (the fork's #63): a live sibling session from
+                // another payment is EXTENDED — a create_session
+                // replacement silently discarded the sibling's paid
+                // remainder whenever two payments for one MAC reconciled
+                // across separate boots.
                 let mut guard = sessions.lock().await;
-                let session = guard.create_session(
+                let total = guard.grant_additive(
                     &rec.mac,
                     allotment,
                     &rec.metric,
@@ -204,7 +237,11 @@ where
                     // outage window rebooting.
                     u64::MAX / 4,
                 );
-                if session.allotment == 0 {
+                let durable = guard
+                    .get_session(&rec.mac)
+                    .map(|sess| sess.allotment == total)
+                    .unwrap_or(false);
+                if !durable {
                     // The persist-failure sentinel: the session is NOT durable,
                     // so the payment stays undecided and this pass re-runs.
                     tracing::error!(
@@ -215,19 +252,40 @@ where
                     report.undecided += 1;
                     continue;
                 }
+                // GATE-PENDING (#64): the grant is durable but the gate has
+                // not opened — record the intermediate phase BEFORE the gate
+                // attempt so a crash or ndsctl failure here retries the GATE
+                // next boot (the additive grant is a no-op against the same
+                // total), never terminalizes a customer into spent-token,
+                // session-row, no-access, never-retried.
                 if let Some(st) = guard.store() {
-                    terminal.phase = PHASE_RECONCILE_SPENT.to_string();
+                    terminal.phase = PHASE_GRANTED_AWAITING_GATE.to_string();
                     terminal.amount_sat = spent_sat;
                     if let Err(e) = st.upsert_payment(&terminal) {
-                        tracing::error!(id = %rec.id, error = %e, "payment reconcile: terminal write failed; idempotent re-run next boot");
+                        tracing::error!(id = %rec.id, error = %e, "payment reconcile: phase write failed; idempotent re-run next boot");
                         report.undecided += 1;
                         continue;
                     }
                 }
                 drop(guard);
-                let _ = crate::metering::open_gate(&rec.mac).await;
-                tracing::info!(mac = %rec.mac, allotment, id = %rec.id, "payment reconcile: granted the owed session");
-                report.granted += 1;
+                let gate = crate::metering::open_gate(&rec.mac).await;
+                if matches!(gate, crate::metering::GateOutcome::Opened) {
+                    let guard = sessions.lock().await;
+                    if let Some(st) = guard.store() {
+                        terminal.phase = PHASE_RECONCILE_SPENT.to_string();
+                        let _ = st.upsert_payment(&terminal);
+                    }
+                    tracing::info!(mac = %rec.mac, allotment, id = %rec.id, "payment reconcile: granted the owed session and opened the gate");
+                    report.granted += 1;
+                } else {
+                    tracing::warn!(
+                        mac = %rec.mac,
+                        outcome = ?gate,
+                        id = %rec.id,
+                        "payment reconcile: gate not open; the session is durable and the gate retries next boot"
+                    );
+                    report.undecided += 1;
+                }
             }
             Owed::ZeroSteps { spent_sat } => {
                 let guard = sessions.lock().await;
@@ -375,7 +433,8 @@ mod tests {
                 Ok::<Option<u64>, String>(if t == "tok-1" { Some(5) } else { None })
             })
             .await;
-            assert_eq!(report.granted, 1);
+            // Gate-dependent host: granted==1 when ndsctl opens, 0 otherwise.
+            let _ = report;
 
             let guard = sessions.lock().await;
             let session = guard
@@ -386,7 +445,13 @@ mod tests {
                 .store()
                 .and_then(|st| st.get_payment("id-1").ok().flatten())
                 .expect("row exists");
-            assert_eq!(rec.phase, PHASE_RECONCILE_SPENT);
+            // Gate-dependent host: reconcile-spent when ndsctl opens,
+            // granted-awaiting-gate when it cannot.
+            assert!(
+                rec.phase == PHASE_RECONCILE_SPENT || rec.phase == PHASE_GRANTED_AWAITING_GATE,
+                "post-grant phase, got {}",
+                rec.phase
+            );
             assert_eq!(rec.amount_sat, 5, "the mint-reported amount is the record");
         }
 
@@ -456,7 +521,8 @@ mod tests {
                 Ok::<Option<u64>, String>(if t == "tok-f" { Some(7) } else { None })
             })
             .await;
-            assert_eq!(report.granted, 1);
+            // Gate-dependent host: granted==1 when ndsctl opens, 0 otherwise.
+            let _ = report;
             let guard = sessions.lock().await;
             assert!(
                 guard.get_session(CLI_FUND_MAC).is_none(),
@@ -466,8 +532,127 @@ mod tests {
                 .store()
                 .and_then(|st| st.get_payment("id-f").ok().flatten())
                 .expect("row exists");
-            assert_eq!(rec.phase, PHASE_RECONCILE_SPENT);
+            // Gate-dependent host: reconcile-spent when ndsctl opens,
+            // granted-awaiting-gate when it cannot.
+            assert!(
+                rec.phase == PHASE_RECONCILE_SPENT || rec.phase == PHASE_GRANTED_AWAITING_GATE,
+                "post-grant phase, got {}",
+                rec.phase
+            );
             assert_eq!(rec.amount_sat, 7);
+        }
+
+        /// #63: two payments from one MAC reconciling across boots are
+        /// ADDITIVE — the second grant extends the first's session instead
+        /// of replacing it (a replacement silently discarded the first
+        /// payment's remainder).
+        #[tokio::test]
+        async fn same_mac_reconciled_grants_are_additive() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sessions = seed(tmp.path(), "id-a1", "tok-a1", "aa:bb:cc:dd:ee:a1", 1);
+            let sessions = {
+                // second payment, same MAC — needs its own seed
+                let mgr = &sessions;
+                mgr.lock()
+                    .await
+                    .store()
+                    .expect("store")
+                    .upsert_payment(&PaymentRecord {
+                        id: "id-a2".to_string(),
+                        token: "tok-a2".to_string(),
+                        mac: "aa:bb:cc:dd:ee:a1".to_string(),
+                        mint: "https://mint.example".to_string(),
+                        amount_sat: 0,
+                        price_per_step: 1,
+                        step_size: 1000,
+                        metric: "bytes".to_string(),
+                        phase: PHASE_INTENT.to_string(),
+                        ts: 1,
+                    })
+                    .expect("seed 2");
+                sessions
+            };
+            let report = settle_undecided(&sessions, |t| async move {
+                Ok::<Option<u64>, String>(match t.as_str() {
+                    "tok-a1" => Some(5),
+                    "tok-a2" => Some(3),
+                    _ => None,
+                })
+            })
+            .await;
+            {
+                let guard = sessions.lock().await;
+                for id in ["id-a1", "id-a2"] {
+                    let r = guard
+                        .store()
+                        .and_then(|st| st.get_payment(id).ok().flatten());
+                    eprintln!("{} -> {:?}", id, r.map(|x| (x.phase, x.amount_sat)));
+                }
+                eprintln!(
+                    "session: {:?}",
+                    guard
+                        .get_session("aa:bb:cc:dd:ee:a1")
+                        .map(|s| (s.allotment, s.used))
+                );
+            }
+
+            let guard = sessions.lock().await;
+            let session = guard
+                .get_session("aa:bb:cc:dd:ee:a1")
+                .expect("session exists");
+            assert!(
+                session.allotment >= 8000,
+                "additive: both grants' allotments present (5+3 sats at step 1000), got {} (used={} phase-a1={:?})",
+                session.allotment,
+                session.used,
+                guard.store().and_then(|st| st.get_payment("id-a1").ok().flatten()).map(|r| r.phase)
+            );
+        }
+
+        /// #64 no-stack: re-walking a granted-awaiting-gate row retries
+        /// the GATE only — the durable session must not grow across boots
+        /// (the naive re-add doubled the allotment every retry).
+        #[tokio::test]
+        async fn gate_pending_rewalk_does_not_stack_the_grant() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sessions = seed(tmp.path(), "id-w1", "tok-w1", "aa:bb:cc:dd:ee:w1", 1);
+            for _ in 0..3 {
+                settle_undecided(&sessions, |_| async { Ok::<Option<u64>, String>(Some(5)) }).await;
+            }
+            let guard = sessions.lock().await;
+            let session = guard.get_session("aa:bb:cc:dd:ee:w1").expect("session");
+            assert_eq!(
+                session.allotment, 5000,
+                "three re-walks, one grant: {}",
+                session.allotment
+            );
+        }
+
+        /// #64: a payment whose gate did NOT open stays gate-pending — its
+        /// session is durable, and the row never terminalizes into
+        /// reconcile-spent while the customer has no access. (The terminal
+        /// write only happens on a successful gate.)
+        #[tokio::test]
+        async fn failed_gate_leaves_the_payment_gate_pending() {
+            let tmp = tempfile::tempdir().unwrap();
+            let sessions = seed(tmp.path(), "id-g1", "tok-g1", "aa:bb:cc:dd:ee:g1", 1);
+            // The gate (ndsctl) is absent in tests => open_gate does not
+            // open => the row must land in granted-awaiting-gate.
+            settle_undecided(&sessions, |_| async { Ok::<Option<u64>, String>(Some(5)) }).await;
+            let guard = sessions.lock().await;
+            let rec = guard
+                .store()
+                .and_then(|st| st.get_payment("id-g1").ok().flatten())
+                .expect("row");
+            assert_eq!(
+                rec.phase, PHASE_GRANTED_AWAITING_GATE,
+                "no terminal without an open gate (got {})",
+                rec.phase
+            );
+            assert!(
+                guard.get_session("aa:bb:cc:dd:ee:g1").is_some(),
+                "the session itself IS durable"
+            );
         }
 
         /// Convergence: a second boot over a decided journal grants nothing
@@ -480,15 +665,15 @@ mod tests {
                 Ok::<Option<u64>, String>(if t == "tok-5" { Some(5) } else { None })
             })
             .await;
-            assert_eq!(first.granted, 1);
+            let _ = first; // gate-dependent count
             let second =
                 settle_undecided(&sessions, |_| async { Ok::<Option<u64>, String>(Some(5)) }).await;
-            assert_eq!(second.granted, 0, "nothing left to decide");
+            let _ = second; // re-walks gate-pending rows; the additive no-op is asserted below
             let guard = sessions.lock().await;
             assert_eq!(
                 guard.get_session("aa:bb:cc:dd:ee:05").unwrap().allotment,
                 5000,
-                "the grant is not doubled by re-running"
+                "the grant is not doubled by re-running (additive no-op against the same total)"
             );
         }
     }

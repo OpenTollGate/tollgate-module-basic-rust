@@ -199,6 +199,30 @@ impl SessionManager {
         &self.sessions
     }
 
+    /// Grant `allotment` to `mac` ADDITIVELY: a live session is EXTENDED
+    /// (preserving its used counter), never replaced — a replacement
+    /// silently discards a sibling grant's paid credit (the fork's #63:
+    /// two payments from one MAC reconciling across boots lost the first
+    /// grant's remainder to the second grant's create_session). Per-PAYMENT
+    /// idempotency lives one level up, in the payments journal's phase —
+    /// this method is additive by construction so a retried grant that
+    /// DOES slip through stacks visibly instead of silently erasing.
+    pub fn grant_additive(
+        &mut self,
+        mac: &str,
+        allotment: u64,
+        metric: &str,
+        ttl_secs: u64,
+    ) -> u64 {
+        match self.extend_session(mac, allotment, metric, ttl_secs) {
+            Some(total) => total,
+            None => {
+                self.create_session(mac, allotment, metric, ttl_secs);
+                allotment
+            }
+        }
+    }
+
     /// Move a session record from one MAC to another (rebind): the paid
     /// allotment, the usage counter and the expiry all follow the customer.
     /// Persisted, so a restart does not split the session across two addresses.
