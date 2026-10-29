@@ -177,15 +177,25 @@ pub struct ProfitShareConfig {
 
 // ── UpstreamDetectorConfig ───────────────────────────────────────────
 /// Duration fields use Go's string format ("10s", "2s", "5m0s").
-/// We keep them as strings for 1:1 JSON compat.
-
+/// We keep them as strings for 1:1 JSON compat — but the GO origin
+/// marshals durations as int64 NANOSECONDS (`time.Duration`'s JSON form),
+/// so a Go-written config carries `"probe_timeout": 10000000000`, not
+/// `"10s"`. A duration field therefore accepts BOTH: a humanized string
+/// (this module's own default format) and a raw nanosecond count (the Go
+/// wire form, re-serialized as humanized on write). Before this, every
+/// Go-written config failed the parse — and before the config fail-closed
+/// fix, that parse failure was silently swallowed into Config::default()
+/// with its arbitrary accepted mint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamDetectorConfig {
-    #[serde(default = "default_probe_timeout")]
+    #[serde(default = "default_probe_timeout", deserialize_with = "de_go_duration")]
     pub probe_timeout: String,
     #[serde(default = "default_probe_retry_count")]
     pub probe_retry_count: i32,
-    #[serde(default = "default_probe_retry_delay")]
+    #[serde(
+        default = "default_probe_retry_delay",
+        deserialize_with = "de_go_duration"
+    )]
     pub probe_retry_delay: String,
     #[serde(default)]
     pub require_valid_signature: bool,
@@ -193,8 +203,55 @@ pub struct UpstreamDetectorConfig {
     pub ignore_interfaces: Vec<String>,
     #[serde(default)]
     pub only_interfaces: Vec<String>,
-    #[serde(default = "default_discovery_timeout")]
+    #[serde(
+        default = "default_discovery_timeout",
+        deserialize_with = "de_go_duration"
+    )]
     pub discovery_timeout: String,
+}
+
+/// Accept a humanized duration string as-is, or a Go `time.Duration`
+/// nanosecond integer, converting to the humanized form.
+fn de_go_duration<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a humanized duration string or a nanosecond integer")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E: serde::de::Error>(self, ns: u64) -> Result<String, E> {
+            Ok(humanize_nanos(ns))
+        }
+        fn visit_i64<E: serde::de::Error>(self, ns: i64) -> Result<String, E> {
+            if ns < 0 {
+                return Err(E::custom("negative duration"));
+            }
+            Ok(humanize_nanos(ns as u64))
+        }
+    }
+    deserializer.deserialize_any(V)
+}
+
+/// Render nanoseconds as the compact humanized form Go's `time.Duration`
+/// uses (10s, 2m0s, 5m0s), preserving the string shape this module's
+/// defaults established.
+fn humanize_nanos(ns: u64) -> String {
+    const NS_PER_MS: u64 = 1_000_000;
+    const NS_PER_S: u64 = 1_000 * NS_PER_MS;
+    const NS_PER_M: u64 = 60 * NS_PER_S;
+    if ns >= NS_PER_M {
+        format!("{}m{}s", ns / NS_PER_M, (ns % NS_PER_M) / NS_PER_S)
+    } else if ns >= NS_PER_S {
+        format!("{}s", ns / NS_PER_S)
+    } else {
+        format!("{}ms", ns / NS_PER_MS)
+    }
 }
 
 fn default_probe_timeout() -> String {
@@ -323,6 +380,7 @@ impl Default for SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageTrackingConfig {
     #[serde(default = "default_data_monitor_interval")]
+    #[serde(deserialize_with = "de_go_duration")]
     pub data_monitoring_interval: String,
 }
 
