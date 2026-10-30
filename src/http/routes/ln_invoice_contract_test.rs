@@ -43,7 +43,7 @@ async fn state_with_mint(mint: &str) -> AppState {
             name: "merchant".to_string(),
             secret_key: secp256k1::SecretKey::from_slice(&[3u8; 32]).unwrap(),
         }),
-        wallet: Arc::new(tokio::sync::Mutex::new(Some(wallet))),
+        wallet: Arc::new(tokio::sync::Mutex::new(Some(std::sync::Arc::new(wallet)))),
         sessions: Arc::new(tokio::sync::Mutex::new(
             crate::session::SessionManager::new(),
         )),
