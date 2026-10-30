@@ -170,7 +170,9 @@ async fn main() {
     let state = Arc::new(http::AppState {
         config: Arc::new(config_obj),
         identity: Arc::new(identity),
-        wallet: Arc::new(tokio::sync::Mutex::new(Some(toll_wallet))),
+        wallet: Arc::new(tokio::sync::Mutex::new(Some(std::sync::Arc::new(
+            toll_wallet,
+        )))),
         sessions: Arc::new(tokio::sync::Mutex::new(
             session::SessionManager::open(&state_db_path).unwrap_or_else(|e| {
                 // FAIL CLOSED: an unreadable store must never be read as "no
@@ -280,7 +282,12 @@ async fn main() {
             );
             let mut minted: Vec<(String, u64)> = Vec::new();
             {
-                let wallet = state.wallet.lock().await;
+                // Clone the Arc, release the container lock — the mint
+                // round trips below must never hold it (issue #30).
+                let wallet = {
+                    let guard = state.wallet.lock().await;
+                    guard.as_ref().map(std::sync::Arc::clone)
+                };
                 if let (Some(w), Some(mint)) = (
                     wallet.as_ref(),
                     wallet.as_ref().and_then(|w| w.default_mint()),
@@ -398,7 +405,10 @@ async fn main() {
                     }
                 };
                 for q in due {
-                    let wallet = monitor_state.wallet.lock().await;
+                    let wallet = {
+                        let guard = monitor_state.wallet.lock().await;
+                        guard.as_ref().map(std::sync::Arc::clone)
+                    };
                     let Some(w) = wallet.as_ref() else { break };
                     let Some(mint) = w.default_mint() else { break };
                     let mint_word = w.check_mint_quote(mint, &q.quote_id).await;
@@ -410,7 +420,10 @@ async fn main() {
                             if upper.contains("PAID") || upper.contains("ISSUED") {
                                 // Settle: mint the value durably; the boot
                                 // settle + customer poll handle the grant.
-                                let wallet = monitor_state.wallet.lock().await;
+                                let wallet = {
+                                    let guard = monitor_state.wallet.lock().await;
+                                    guard.as_ref().map(std::sync::Arc::clone)
+                                };
                                 if let (Some(w), Some(mint)) = (
                                     wallet.as_ref(),
                                     wallet.as_ref().and_then(|w| w.default_mint()),
@@ -483,7 +496,10 @@ async fn main() {
                     .map(|m| m.url.clone())
                     .collect();
                 for mint in &mints {
-                    let wallet = state.wallet.lock().await;
+                    let wallet = {
+                        let guard = state.wallet.lock().await;
+                        guard.as_ref().map(std::sync::Arc::clone)
+                    };
                     let Some(w) = wallet.as_ref() else {
                         continue;
                     };

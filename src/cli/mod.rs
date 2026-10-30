@@ -573,10 +573,8 @@ mod tests {
             secret_key,
         });
 
-        let wallet = Arc::new(tokio::sync::Mutex::new(Some(TollWallet::new(
-            [0u8; 64],
-            vec![],
-            std::path::PathBuf::from("/tmp"),
+        let wallet = Arc::new(tokio::sync::Mutex::new(Some(std::sync::Arc::new(
+            TollWallet::new([0u8; 64], vec![], std::path::PathBuf::from("/tmp")),
         ))));
         // P1: durable. Same fail-closed rule as main.rs — an unreadable store
         // must not be read as "no sessions".

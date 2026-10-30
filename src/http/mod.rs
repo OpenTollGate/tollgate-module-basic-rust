@@ -14,7 +14,13 @@ use tower_http::cors::{Any, CorsLayer};
 pub struct AppState {
     pub config: Arc<crate::config::Config>,
     pub identity: Arc<crate::identity::MerchantIdentity>,
-    pub wallet: Arc<tokio::sync::Mutex<Option<crate::wallet::wallet::TollWallet>>>,
+    /// The wallet behind a shareable Arc: callers clone the Arc out
+    /// (container lock held only for the clone) and then operate without
+    /// it — background passes with network legs (boot settle, keyset
+    /// hygiene, the quote monitor) must never hold the container lock
+    /// across a network round trip, or one hung mint blocks every
+    /// payment handler (issue #30).
+    pub wallet: Arc<tokio::sync::Mutex<Option<std::sync::Arc<crate::wallet::wallet::TollWallet>>>>,
     pub sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
     /// A5: mint quotes created by `/ln-invoice`.
     pub quotes: Arc<std::sync::Mutex<crate::http::routes::quote::MintQuoteRegistry>>,
