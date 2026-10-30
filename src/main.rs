@@ -8,6 +8,20 @@ use tollgate_module_basic_rust::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Poll backoff for one unsettled quote: exponential from base 4s, factor 2,
+/// capped at 60s, with ±20% jitter so a cohort of quotes never synchronizes
+/// (the PRTA backoff suite's contract: first interval >= 4s, second >= 8s,
+/// jitter observable across intervals).
+fn quote_poll_delay(previous_secs: u64, mint_unreachable: bool) -> u64 {
+    let base = if mint_unreachable {
+        (previous_secs.max(4) * 2).min(60)
+    } else {
+        4
+    };
+    let span = (base / 5).max(1);
+    (base + rand::random::<u64>() % (span * 2 + 1)).saturating_sub(span)
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing — must happen before anything else
@@ -349,6 +363,107 @@ async fn main() {
         }
     }
 
+    // Lightning quote monitor (Go parity): settle paid quotes in the
+    // background so value lands in the wallet and the customer's session is
+    // granted on their next poll — without the poller, a paid invoice whose
+    // owner stops polling leaves the sats stranded at the mint. Polling uses
+    // exponential backoff with jitter per quote (base 4s, factor 2, cap 60s,
+    // ±20% jitter): a mint under load is not hammered (the PRTA backoff
+    // suite's exact contract — first interval >= 4s, second >= 8s, jitter
+    // observable), and a settling quote costs one request per interval.
+    {
+        let monitor_state = state.clone();
+        tokio::spawn(async move {
+            let mut backoff: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(4));
+            loop {
+                tick.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let due: Vec<crate::session::store::StoredQuote> = {
+                    let sessions = monitor_state.sessions.lock().await;
+                    match sessions.store() {
+                        Some(st) => st
+                            .quotes_in_state("unpaid")
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|q| {
+                                q.expires_at > now && now >= *backoff.get(&q.quote_id).unwrap_or(&0)
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    }
+                };
+                for q in due {
+                    let wallet = monitor_state.wallet.lock().await;
+                    let Some(w) = wallet.as_ref() else { break };
+                    let Some(mint) = w.default_mint() else { break };
+                    let mint_word = w.check_mint_quote(mint, &q.quote_id).await;
+                    let mint_reachable = mint_word.is_ok();
+                    drop(wallet);
+                    let next = match mint_word {
+                        Ok(word) => {
+                            let upper = word.to_uppercase();
+                            if upper.contains("PAID") || upper.contains("ISSUED") {
+                                // Settle: mint the value durably; the boot
+                                // settle + customer poll handle the grant.
+                                let wallet = monitor_state.wallet.lock().await;
+                                if let (Some(w), Some(mint)) = (
+                                    wallet.as_ref(),
+                                    wallet.as_ref().and_then(|w| w.default_mint()),
+                                ) {
+                                    if let Ok(sats) = w.mint_tokens(mint, &q.quote_id).await {
+                                        tracing::info!(
+                                            quote = %q.quote_id,
+                                            sats,
+                                            "quote monitor: minted a paid quote in the background"
+                                        );
+                                        let sessions = monitor_state.sessions.lock().await;
+                                        if let Some(st) = sessions.store() {
+                                            let _ = st.set_quote_state(&q.quote_id, "issued");
+                                        }
+                                    }
+                                }
+                                continue; // settled: no more polling
+                            }
+                            // Still unpaid: reset to base (the mint answered).
+                            4
+                        }
+                        Err(_) => {
+                            // Mint unreachable: back off exponentially.
+                            let prev = backoff.get(&q.quote_id).copied().unwrap_or(4).max(4);
+                            (prev * 2).min(60)
+                        }
+                    };
+                    // Jitter ±20% so a cohort of quotes does not synchronize.
+                    let prev_interval = backoff.get(&q.quote_id).copied().unwrap_or(4);
+                    let next_at = now + quote_poll_delay(prev_interval, !mint_reachable);
+                    backoff.insert(q.quote_id.clone(), next_at);
+                }
+                // Drop settled quotes from the backoff map.
+                let settled: Vec<String> = {
+                    let sessions = monitor_state.sessions.lock().await;
+                    sessions
+                        .store()
+                        .map(|st| {
+                            st.quotes_in_state("issued")
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|q| q.quote_id)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                for id in settled {
+                    backoff.remove(&id);
+                }
+            }
+        });
+    }
+
     // Keyset hygiene (R10): every boot and each 6h, per configured mint —
     // refresh the keyset list, warn about unspent proofs parked on keysets
     // the mint retired (they can still be spent but will never be issued to
@@ -535,4 +650,36 @@ async fn main() {
     http_handle.abort();
     cli_handle.abort();
     tracing::info!("shutdown complete");
+}
+
+#[cfg(test)]
+mod quote_backoff_tests {
+    use super::quote_poll_delay;
+
+    #[test]
+    fn reachable_mint_resets_to_base() {
+        for _ in 0..50 {
+            let d = quote_poll_delay(60, false);
+            assert!(d >= 3 && d <= 5, "base 4s ± 20% jitter, got {d}");
+        }
+    }
+
+    #[test]
+    fn unreachable_mint_backs_off_exponentially() {
+        // first: 4 -> 8 window, second: 8 -> 16 window (both ±20%)
+        for _ in 0..50 {
+            let first = quote_poll_delay(4, true);
+            assert!(first >= 6 && first <= 10, "8 ± 20%, got {first}");
+            let second = quote_poll_delay(first, true);
+            assert!(second >= first && second <= 22, "16 ± 20%, got {second}");
+        }
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        for _ in 0..50 {
+            let d = quote_poll_delay(60, true);
+            assert!(d <= 72, "cap 60 + 20% jitter, got {d}");
+        }
+    }
 }
