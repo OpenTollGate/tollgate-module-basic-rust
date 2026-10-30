@@ -36,6 +36,33 @@ pub fn version_string() -> String {
 }
 
 /// Start the Unix socket CLI server with shared AppState.
+/// Go CLI-envelope compat: a line that is a JSON object with a
+/// `command` field is unwrapped to `command [args...]` (the Go client's
+/// `--json` form); anything else returns as-is (this module's bare-line
+/// protocol). Unknown JSON that lacks a `command` key is returned
+/// unchanged so the bare-command error message stays honest.
+fn unwrap_cli_envelope(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.starts_with('{') {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return std::borrow::Cow::Borrowed(line);
+    };
+    let Some(command) = v.get("command").and_then(|c| c.as_str()) else {
+        return std::borrow::Cow::Borrowed(line);
+    };
+    // Reassemble `command [args...]` (the Go --json client's form); args
+    // are optional and absent for every command the Go client drives.
+    let mut out = String::from(command);
+    if let Some(args) = v.get("args").and_then(|a| a.as_array()) {
+        for arg in args.iter().filter_map(|a| a.as_str()) {
+            out.push(' ');
+            out.push_str(arg);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 pub async fn serve(state: Arc<AppState>) -> std::io::Result<()> {
     let path = socket_path();
 
@@ -83,8 +110,16 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: Arc<AppState>)
         match buf_reader.read_line(&mut line).await {
             Ok(0) => break, // EOF
             Ok(_) => {
-                let cmd = line.trim();
-                let response = handle_command(cmd, &state).await;
+                // Protocol compat: the Go CLI client (`tollgate --json
+                // <cmd>`) speaks a JSON envelope ({"command":..., "args":
+                // [...], "timestamp":...}) to this same socket; bare-line
+                // commands are this module's native form. Accept both: a
+                // line that parses as the envelope is unwrapped; anything
+                // else is treated as a bare command. Without this, the Go
+                // client's every request answered "unknown command:
+                // {json...}" (the mint_health test class).
+                let cmd = unwrap_cli_envelope(line.trim());
+                let response = handle_command(&cmd, &state).await;
                 if let Err(e) = writer.write_all(response.as_bytes()).await {
                     tracing::warn!(error = %e, "write failed on CLI socket");
                     break;
@@ -679,5 +714,29 @@ mod tests {
             serde_json::from_str(json["message"].as_str().unwrap()).unwrap();
         assert_eq!(report["total"], 2);
         assert_eq!(report["failed"], 2);
+    }
+
+    #[test]
+    fn go_json_envelope_unwraps_to_bare_command() {
+        let line = r#"{"command":"status","timestamp":"2026-10-28T15:04:24Z"}"#;
+        assert_eq!(unwrap_cli_envelope(line), "status");
+    }
+
+    #[test]
+    fn go_json_envelope_with_args_reassembles() {
+        let line = r#"{"command":"wallet","args":["balance"],"timestamp":"x"}"#;
+        assert_eq!(unwrap_cli_envelope(line), "wallet balance");
+    }
+
+    #[test]
+    fn bare_line_passes_through() {
+        assert_eq!(unwrap_cli_envelope("status"), "status");
+        assert_eq!(unwrap_cli_envelope("wallet balance"), "wallet balance");
+    }
+
+    #[test]
+    fn non_command_json_passes_through_unchanged() {
+        let line = r#"{"not":"a command"}"#;
+        assert_eq!(unwrap_cli_envelope(line), line);
     }
 }
